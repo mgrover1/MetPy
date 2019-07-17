@@ -807,7 +807,8 @@ def altimeter_to_station_pressure(altimeter_value, height):
     Returns
     --------
     station_pressure: `pint.Quantity`
-        The station pressure in hPa, which can be used to calculate sea-level pressure
+        The station pressure in hPa or in. Hg, which can be used to calculate sea-level
+        pressure
 
     See Also
     ---------
@@ -849,8 +850,8 @@ def altimeter_to_station_pressure(altimeter_value, height):
                        \right) \right] ^ \frac{1}{n} + 0.3
 
     """
-    # Units for pressure need to be in hectopascals for correct calculation
-    altim = altimeter_value.to('hPa')
+    # Shorten the name for altimeter value
+    altim = altimeter_value
 
     # Gamma Value for this case
     gamma = 0.0065 * units('K/m')
