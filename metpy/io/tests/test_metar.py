@@ -120,3 +120,4 @@ def test_file_test(input_file=None):
     df = metar.text_file_parse(input_file)
     test = df[df.station_id == 'KVPZ']
     assert test.air_temperature.values == 23
+    assert test.air_pressure_at_sea_level.values == 1016.75
