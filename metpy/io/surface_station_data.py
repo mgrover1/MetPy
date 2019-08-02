@@ -1,11 +1,9 @@
-# Copyright (c) 2008,2015,2016,2017,2018,2019 MetPy Developers.
-# Distributed under the terms of the BSD 3-Clause License.
-# SPDX-License-Identifier: BSD-3-Clause
 """Pull out station metadata for metars."""
 from collections import defaultdict, namedtuple
 import csv
 import logging
 
+import pandas as pd
 
 from metpy.cbook import get_test_data
 
@@ -110,20 +108,13 @@ def _read_airports_file(input_file=None):
     """Read the airports file."""
     if input_file is None:
         input_file = get_test_data('airport-codes.csv', as_file_obj=False)
-    with open(input_file, 'rt') as station_file:
-        station_file.readline()  # Skip header
-        csvreader = csv.reader(station_file)
-        for info in csvreader:
-            stid = info[0]
-            new_stid = info[10]  # Use GPS code rather than ID at start of line
-            if not stid.endswith(new_stid):
-                stid = new_stid
-            station_map[stid] = Station(stid, synop_id=99999,
-                                        latitude=float(info[3]), longitude=float(info[4]),
-                                        altitude=float(info[5] if info[5]
-                                                       else 0) * (25.4 * 12 / 1000.),
-                                        country=info[7],
-                                        state=info[8].split('-')[-1], name=info[9])
+    df = pd.read_csv(input_file).drop_duplicates
+    station_map = pd.DataFrame({'id': df.ident.values, 'synop_id': 99999,
+                                'latitude': df.latitude_deg.values,
+                                'longitude': df.longitude_deg.values,
+                                'altitude': ((df.elevation_ft.values * units.ft) * units.m).m,
+                                'country': df.iso_region.str.split('-', n=1),
+                                expand=True[1].values}).to_dict()
     return station_map
 
 
