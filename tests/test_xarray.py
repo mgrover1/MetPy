@@ -11,8 +11,9 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from metpy.plots.mapping import CFProjection
 from metpy.testing import (assert_almost_equal, assert_array_almost_equal, assert_array_equal,
-                           check_and_silence_deprecation, get_test_data)
+                           get_test_data)
 from metpy.units import units
 from metpy.xarray import check_axis, check_matching_coordinates, preprocess_xarray
 
@@ -95,27 +96,68 @@ def test_unit_array(test_var):
 
 def test_units(test_var):
     """Test the units property on the accessor."""
-    assert test_var.metpy.units == units('kelvin')
+    assert test_var.metpy.units == units.kelvin
 
 
 def test_units_percent():
-    """Test that '%' is converted to 'percent'."""
+    """Test that '%' is handled as 'percent'."""
     test_var_percent = xr.open_dataset(
         get_test_data('irma_gfs_example.nc',
                       as_file_obj=False))['Relative_humidity_isobaric']
-    assert test_var_percent.metpy.units == units('percent')
+    assert test_var_percent.metpy.units == units.percent
+
+
+def test_magnitude_with_quantity(test_var):
+    """Test magnitude property on accessor when data is a quantity."""
+    assert isinstance(test_var.metpy.magnitude, np.ndarray)
+    np.testing.assert_array_almost_equal(test_var.metpy.magnitude, np.asarray(test_var.values))
+
+
+def test_magnitude_without_quantity(test_ds_generic):
+    """Test magnitude property on accessor when data is not a quantity."""
+    assert isinstance(test_ds_generic['test'].data, np.ndarray)
+    np.testing.assert_array_equal(
+        test_ds_generic['test'].metpy.magnitude,
+        np.asarray(test_ds_generic['test'].values)
+    )
 
 
 def test_convert_units(test_var):
-    """Test in-place conversion of units."""
-    test_var.metpy.convert_units('degC')
+    """Test conversion of units."""
+    result = test_var.metpy.convert_units('degC')
 
-    # Check that variable metadata is updated
-    assert units(test_var.attrs['units']) == units('degC')
+    # Check that units are updated without modifying original
+    assert result.metpy.units == units.degC
+    assert test_var.metpy.units == units.kelvin
 
     # Make sure we now get an array back with properly converted values
-    assert test_var.metpy.unit_array.units == units.degC
-    assert_almost_equal(test_var[0, 0, 0, 0], 18.44 * units.degC, 2)
+    assert_almost_equal(result[0, 0, 0, 0], 18.44 * units.degC, 2)
+
+
+def test_convert_coordinate_units(test_ds_generic):
+    """Test conversion of coordinate units."""
+    result = test_ds_generic['test'].metpy.convert_coordinate_units('b', 'percent')
+    assert result['b'].data[1] == 100.
+    assert result['b'].metpy.units == units.percent
+
+
+def test_quantify(test_ds_generic):
+    """Test quantify method for converting data to Quantity."""
+    original = test_ds_generic['test'].values
+    result = test_ds_generic['test'].metpy.quantify()
+    assert isinstance(result.data, units.Quantity)
+    assert result.data.units == units.dimensionless
+    assert 'units' not in result.attrs
+    np.testing.assert_array_almost_equal(result.data, units.Quantity(original))
+
+
+def test_dequantify(test_var):
+    """Test dequantify method for converting data away from Quantity."""
+    original = test_var.data
+    result = test_var.metpy.dequantify()
+    assert isinstance(result.data, np.ndarray)
+    assert result.attrs['units'] == 'kelvin'
+    np.testing.assert_array_almost_equal(result.data, original.magnitude)
 
 
 def test_radian_projection_coords():
@@ -178,12 +220,6 @@ def test_preprocess_xarray():
     assert_array_equal(func(data, b=data2), np.array([1001, 1001, 1001]) * units.m)
 
 
-def test_strftime():
-    """Test our monkey-patched xarray strftime."""
-    data = xr.DataArray(np.datetime64('2000-01-01 01:00:00'))
-    assert '2000-01-01 01:00:00' == data.dt.strftime('%Y-%m-%d %H:%M:%S')
-
-
 def test_coordinates_basic_by_method(test_var):
     """Test that NARR example coordinates are like we expect using coordinates method."""
     x, y, vertical, time = test_var.metpy.coordinates('x', 'y', 'vertical', 'time')
@@ -228,20 +264,6 @@ def test_coordinates_specified_by_dataarray_with_dataset(test_ds_generic):
     assert data['test']['b'].identical(y)
     assert data['test']['a'].identical(vertical)
     assert data['test']['d'].identical(time)
-
-
-@check_and_silence_deprecation
-def test_coordinates_specified_using_cf_axis(test_ds_generic):
-    """Test deprecated specification of coordinates using CF axis keys."""
-    data = test_ds_generic.metpy.parse_cf('test', coordinates={'Z': 'e'})
-    assert data['e'].identical(data.metpy.vertical)
-
-
-def test_bad_coordinate_type(test_var):
-    """Test that an AttributeError is raised when a bad axis/coordinate type is given."""
-    with pytest.raises(AttributeError) as exc:
-        next(test_var.metpy.coordinates('bad_axis_type'))
-    assert 'not an interpretable axis' in str(exc.value)
 
 
 def test_missing_coordinate_type(test_ds_generic):
@@ -477,19 +499,6 @@ def test_check_matching_coordinates(test_ds_generic):
         add(test_ds_generic['test'], other)
 
 
-@check_and_silence_deprecation
-def test_as_timestamp(test_var):
-    """Test the as_timestamp method for a time DataArray."""
-    time = test_var.metpy.time
-    truth = xr.DataArray(np.array([544557600]),
-                         name='time',
-                         coords=time.coords,
-                         dims='time',
-                         attrs={'long_name': 'forecast time', '_metpy_axis': 'time',
-                                'units': 'seconds'})
-    assert truth.identical(time.metpy.as_timestamp())
-
-
 def test_time_deltas():
     """Test the time_deltas attribute."""
     ds = xr.open_dataset(get_test_data('irma_gfs_example.nc', as_file_obj=False))
@@ -517,6 +526,28 @@ def test_find_axis_name_bad_identifier(test_var):
     """Test getting axis name using the axis type identifier."""
     with pytest.raises(ValueError) as exc:
         test_var.metpy.find_axis_name('ens')
+    assert 'axis is not valid' in str(exc.value)
+
+
+def test_find_axis_number_integer(test_var):
+    """Test getting axis number using the axis number identifier."""
+    assert test_var.metpy.find_axis_number(2) == 2
+
+
+def test_find_axis_number_axis_type(test_var):
+    """Test getting axis number using the axis type identifier."""
+    assert test_var.metpy.find_axis_number('vertical') == 1
+
+
+def test_find_axis_number_dim_coord_number(test_var):
+    """Test getting axis number using the dimension coordinate name identifier."""
+    assert test_var.metpy.find_axis_number('isobaric') == 1
+
+
+def test_find_axis_number_bad_identifier(test_var):
+    """Test getting axis number using the axis type identifier."""
+    with pytest.raises(ValueError) as exc:
+        test_var.metpy.find_axis_number('ens')
     assert 'axis is not valid' in str(exc.value)
 
 
@@ -668,13 +699,6 @@ def test_coordinate_identification_shared_but_not_equal_coords():
     assert ds['isobaric2'].identical(ds['u'].metpy.vertical)
 
 
-def test_check_no_quantification_of_xarray_data(test_ds_generic):
-    """Test that .unit_array setter does not insert a `pint.Quantity` into the DataArray."""
-    var = test_ds_generic['e']
-    var.metpy.unit_array = [1000, 925, 850, 700, 500] * units.hPa
-    assert not isinstance(var.data, units.Quantity)
-
-
 def test_one_dimensional_lat_lon(test_ds_generic):
     """Test that 1D lat/lon coords are recognized as both x/y and longitude/latitude."""
     test_ds_generic['d'].attrs['units'] = 'degrees_north'
@@ -694,22 +718,265 @@ def test_auxilary_lat_lon_with_xy(test_var_multidim_full):
     assert test_var_multidim_full['lon'].identical(test_var_multidim_full.metpy.longitude)
 
 
-@check_and_silence_deprecation
 def test_auxilary_lat_lon_without_xy(test_var_multidim_no_xy):
-    """Test that multidimensional lat/lon are recognized in absence of x/y coords.
-
-    TODO (v1.0): Remove check_and_silence_deprecation that is needed for now since these
-    lat/lon coords are also assigned to y/x.
-    """
+    """Test that multidimensional lat/lon are recognized in absence of x/y coords."""
     assert test_var_multidim_no_xy['lat'].identical(test_var_multidim_no_xy.metpy.latitude)
     assert test_var_multidim_no_xy['lon'].identical(test_var_multidim_no_xy.metpy.longitude)
 
 
-@check_and_silence_deprecation
 def test_auxilary_lat_lon_without_xy_as_xy(test_var_multidim_no_xy):
-    """Test the pre-v1.0 behavior of multidimensional lat/lon being acceptable as x/y coords.
+    """Test that the pre-v1.0 behavior of multidimensional lat/lon errors."""
+    with pytest.raises(AttributeError):
+        test_var_multidim_no_xy.metpy.y
 
-    TODO (v1.0): Replace with test that y and x coords are not available in this case.
-    """
-    assert test_var_multidim_no_xy['lat'].identical(test_var_multidim_no_xy.metpy.y)
-    assert test_var_multidim_no_xy['lon'].identical(test_var_multidim_no_xy.metpy.x)
+    with pytest.raises(AttributeError):
+        test_var_multidim_no_xy.metpy.x
+
+
+# Declare a sample projection with CF attributes
+sample_cf_attrs = {
+    'grid_mapping_name': 'lambert_conformal_conic',
+    'earth_radius': 6370000,
+    'standard_parallel': [30., 40.],
+    'longitude_of_central_meridian': 260.,
+    'latitude_of_projection_origin': 35.
+}
+
+
+def test_assign_crs_dataarray_by_argument(test_ds_generic):
+    """Test assigning CRS to DataArray by projection dict."""
+    da = test_ds_generic['test']
+    new_da = da.metpy.assign_crs(sample_cf_attrs)
+    assert isinstance(new_da.metpy.cartopy_crs, ccrs.LambertConformal)
+    assert new_da['crs'] == CFProjection(sample_cf_attrs)
+
+
+def test_assign_crs_dataarray_by_kwargs(test_ds_generic):
+    """Test assigning CRS to DataArray by projection kwargs."""
+    da = test_ds_generic['test']
+    new_da = da.metpy.assign_crs(**sample_cf_attrs)
+    assert isinstance(new_da.metpy.cartopy_crs, ccrs.LambertConformal)
+    assert new_da['crs'] == CFProjection(sample_cf_attrs)
+
+
+def test_assign_crs_dataset_by_argument(test_ds_generic):
+    """Test assigning CRS to Dataset by projection dict."""
+    new_ds = test_ds_generic.metpy.assign_crs(sample_cf_attrs)
+    assert isinstance(new_ds['test'].metpy.cartopy_crs, ccrs.LambertConformal)
+    assert new_ds['crs'] == CFProjection(sample_cf_attrs)
+
+
+def test_assign_crs_dataset_by_kwargs(test_ds_generic):
+    """Test assigning CRS to Dataset by projection kwargs."""
+    new_ds = test_ds_generic.metpy.assign_crs(**sample_cf_attrs)
+    assert isinstance(new_ds['test'].metpy.cartopy_crs, ccrs.LambertConformal)
+    assert new_ds['crs'] == CFProjection(sample_cf_attrs)
+
+
+def test_assign_crs_error_with_both_attrs(test_ds_generic):
+    """Test ValueError is raised when both dictionary and kwargs given."""
+    with pytest.raises(ValueError) as exc:
+        test_ds_generic.metpy.assign_crs(sample_cf_attrs, **sample_cf_attrs)
+    assert 'Cannot specify both' in str(exc)
+
+
+def test_assign_crs_error_with_neither_attrs(test_ds_generic):
+    """Test ValueError is raised when neither dictionary and kwargs given."""
+    with pytest.raises(ValueError) as exc:
+        test_ds_generic.metpy.assign_crs()
+    assert 'Must specify either' in str(exc)
+
+
+def test_assign_latitude_longitude_no_horizontal(test_ds_generic):
+    """Test that assign_latitude_longitude only warns when no horizontal coordinates."""
+    with pytest.warns(UserWarning):
+        xr.testing.assert_identical(test_ds_generic,
+                                    test_ds_generic.metpy.assign_latitude_longitude())
+
+
+def test_assign_y_x_no_horizontal(test_ds_generic):
+    """Test that assign_y_x only warns when no horizontal coordinates."""
+    with pytest.warns(UserWarning):
+        xr.testing.assert_identical(test_ds_generic,
+                                    test_ds_generic.metpy.assign_y_x())
+
+
+@pytest.fixture
+def test_coord_helper_da_yx():
+    """Provide a DataArray with y/x coords for coord helpers."""
+    return xr.DataArray(np.arange(9).reshape((3, 3)),
+                        dims=('y', 'x'),
+                        coords={'y': np.linspace(0, 1e5, 3),
+                                'x': np.linspace(-1e5, 0, 3),
+                                'crs': CFProjection(sample_cf_attrs)})
+
+
+@pytest.fixture
+def test_coord_helper_da_dummy_latlon(test_coord_helper_da_yx):
+    """Provide DataArray with bad dummy lat/lon coords to be overwritten."""
+    return test_coord_helper_da_yx.assign_coords(latitude=0., longitude=0.)
+
+
+@pytest.fixture
+def test_coord_helper_da_latlon():
+    """Provide a DataArray with lat/lon coords for coord helpers."""
+    return xr.DataArray(
+        np.arange(9).reshape((3, 3)),
+        dims=('y', 'x'),
+        coords={
+            'latitude': xr.DataArray(
+                np.array(
+                    [[34.99501239, 34.99875307, 35.],
+                     [35.44643155, 35.45019292, 35.45144675],
+                     [35.89782579, 35.90160784, 35.90286857]]
+                ),
+                dims=('y', 'x')
+            ),
+            'longitude': xr.DataArray(
+                np.array(
+                    [[-101.10219213, -100.55111288, -100.],
+                     [-101.10831414, -100.55417417, -100.],
+                     [-101.11450453, -100.55726965, -100.]]
+                ),
+                dims=('y', 'x')
+            ),
+            'crs': CFProjection(sample_cf_attrs)
+        }
+    )
+
+
+@pytest.fixture
+def test_coord_helper_da_dummy_yx(test_coord_helper_da_latlon):
+    """Provide DataArray with bad dummy y/x coords to be overwritten."""
+    return test_coord_helper_da_latlon.assign_coords(y=range(3), x=range(3))
+
+
+def test_assign_latitude_longitude_basic_dataarray(test_coord_helper_da_yx,
+                                                   test_coord_helper_da_latlon):
+    """Test assign_latitude_longitude in basic usage on DataArray."""
+    new_da = test_coord_helper_da_yx.metpy.assign_latitude_longitude()
+    lat, lon = new_da.metpy.coordinates('latitude', 'longitude')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['latitude'].values,
+                                         lat.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['longitude'].values,
+                                         lon.values, 3)
+
+
+def test_assign_latitude_longitude_error_existing_dataarray(
+        test_coord_helper_da_dummy_latlon):
+    """Test assign_latitude_longitude failure with existing coordinates."""
+    with pytest.raises(RuntimeError) as exc:
+        test_coord_helper_da_dummy_latlon.metpy.assign_latitude_longitude()
+    assert 'Latitude/longitude coordinate(s) are present' in str(exc)
+
+
+def test_assign_latitude_longitude_force_existing_dataarray(
+        test_coord_helper_da_dummy_latlon, test_coord_helper_da_latlon):
+    """Test assign_latitude_longitude with existing coordinates forcing new."""
+    new_da = test_coord_helper_da_dummy_latlon.metpy.assign_latitude_longitude(True)
+    lat, lon = new_da.metpy.coordinates('latitude', 'longitude')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['latitude'].values,
+                                         lat.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['longitude'].values,
+                                         lon.values, 3)
+
+
+def test_assign_latitude_longitude_basic_dataset(test_coord_helper_da_yx,
+                                                 test_coord_helper_da_latlon):
+    """Test assign_latitude_longitude in basic usage on Dataset."""
+    ds = test_coord_helper_da_yx.to_dataset(name='test').metpy.assign_latitude_longitude()
+    lat, lon = ds['test'].metpy.coordinates('latitude', 'longitude')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['latitude'].values,
+                                         lat.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_latlon['longitude'].values,
+                                         lon.values, 3)
+
+
+def test_assign_y_x_basic_dataarray(test_coord_helper_da_yx, test_coord_helper_da_latlon):
+    """Test assign_y_x in basic usage on DataArray."""
+    new_da = test_coord_helper_da_latlon.metpy.assign_y_x()
+    y, x = new_da.metpy.coordinates('y', 'x')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['y'].values, y.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['x'].values, x.values, 3)
+
+
+def test_assign_y_x_error_existing_dataarray(
+        test_coord_helper_da_dummy_yx):
+    """Test assign_y_x failure with existing coordinates."""
+    with pytest.raises(RuntimeError) as exc:
+        test_coord_helper_da_dummy_yx.metpy.assign_y_x()
+    assert 'y/x coordinate(s) are present' in str(exc)
+
+
+def test_assign_y_x_force_existing_dataarray(
+        test_coord_helper_da_dummy_yx, test_coord_helper_da_yx):
+    """Test assign_y_x with existing coordinates forcing new."""
+    new_da = test_coord_helper_da_dummy_yx.metpy.assign_y_x(True)
+    y, x = new_da.metpy.coordinates('y', 'x')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['y'].values, y.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['x'].values, x.values, 3)
+
+
+def test_assign_y_x_dataarray_outside_tolerance(test_coord_helper_da_latlon):
+    """Test assign_y_x raises ValueError when tolerance is exceeded on DataArray."""
+    with pytest.raises(ValueError) as exc:
+        test_coord_helper_da_latlon.metpy.assign_y_x(tolerance=1 * units('um'))
+    assert 'cannot be collapsed to 1D within tolerance' in str(exc)
+
+
+def test_assign_y_x_dataarray_transposed(test_coord_helper_da_yx, test_coord_helper_da_latlon):
+    """Test assign_y_x on DataArray with transposed order."""
+    new_da = test_coord_helper_da_latlon.transpose(transpose_coords=True).metpy.assign_y_x()
+    y, x = new_da.metpy.coordinates('y', 'x')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['y'].values, y.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['x'].values, x.values, 3)
+
+
+def test_assign_y_x_dataset_assumed_order(test_coord_helper_da_yx,
+                                          test_coord_helper_da_latlon):
+    """Test assign_y_x on Dataset where order must be assumed."""
+    with pytest.warns(UserWarning):
+        new_ds = test_coord_helper_da_latlon.to_dataset(name='test').rename_dims(
+            {'y': 'b', 'x': 'a'}).metpy.assign_y_x()
+    y, x = new_ds['test'].metpy.coordinates('y', 'x')
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['y'].values, y.values, 3)
+    np.testing.assert_array_almost_equal(test_coord_helper_da_yx['x'].values, x.values, 3)
+    assert y.name == 'b'
+    assert x.name == 'a'
+
+
+def test_assign_y_x_error_existing_dataset(
+        test_coord_helper_da_dummy_yx):
+    """Test assign_y_x failure with existing coordinates for Dataset."""
+    with pytest.raises(RuntimeError) as exc:
+        test_coord_helper_da_dummy_yx.to_dataset(name='test').metpy.assign_y_x()
+    assert 'y/x coordinate(s) are present' in str(exc)
+
+
+def test_update_attribute_dictionary(test_ds_generic):
+    """Test update_attribute using dictionary."""
+    descriptions = {
+        'test': 'Filler data',
+        'c': 'The third coordinate'
+    }
+    test_ds_generic.metpy.update_attribute('description', descriptions)
+    assert 'description' not in test_ds_generic['a'].attrs
+    assert 'description' not in test_ds_generic['b'].attrs
+    assert test_ds_generic['c'].attrs['description'] == 'The third coordinate'
+    assert 'description' not in test_ds_generic['d'].attrs
+    assert 'description' not in test_ds_generic['e'].attrs
+    assert test_ds_generic['test'].attrs['description'] == 'Filler data'
+
+
+def test_update_attribute_callable(test_ds_generic):
+    """Test update_attribute using callable."""
+    def even_ascii(varname, **kwargs):
+        if ord(varname[0]) % 2 == 0:
+            return 'yes'
+    test_ds_generic.metpy.update_attribute('even', even_ascii)
+    assert 'even' not in test_ds_generic['a'].attrs
+    assert test_ds_generic['b'].attrs['even'] == 'yes'
+    assert 'even' not in test_ds_generic['c'].attrs
+    assert test_ds_generic['d'].attrs['even'] == 'yes'
+    assert 'even' not in test_ds_generic['e'].attrs
+    assert test_ds_generic['test'].attrs['even'] == 'yes'

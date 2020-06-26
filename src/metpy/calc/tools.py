@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Contains a collection of generally useful calculation tools."""
 import functools
+from inspect import signature
 from operator import itemgetter
+import warnings
 
 import numpy as np
 from numpy.core.numeric import normalize_axis_index
@@ -14,7 +16,7 @@ import xarray as xr
 from ..cbook import broadcast_indices, result_type
 from ..interpolate import interpolate_1d, log_interpolate_1d
 from ..package_tools import Exporter
-from ..units import atleast_1d, check_units, concatenate, diff, units
+from ..units import check_units, concatenate, units
 from ..xarray import check_axis, preprocess_xarray
 
 exporter = Exporter(globals())
@@ -306,10 +308,10 @@ def reduce_point_density(points, radius, priority=None):
     return keep
 
 
-def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
+def _get_bound_pressure_height(pressure, bound, height=None, interpolate=True):
     """Calculate the bounding pressure and height in a layer.
 
-    Given pressure, optional heights, and a bound, return either the closest pressure/height
+    Given pressure, optional heights and a bound, return either the closest pressure/height
     or interpolated pressure/height. If no heights are provided, a standard atmosphere
     ([NOAA1976]_) is assumed.
 
@@ -319,7 +321,7 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
         Atmospheric pressures
     bound : `pint.Quantity`
         Bound to retrieve (in pressure or height)
-    heights : `pint.Quantity`, optional
+    height : `pint.Quantity`, optional
         Atmospheric heights associated with the pressure levels. Defaults to using
         heights calculated from ``pressure`` assuming a standard atmosphere.
     interpolate : boolean, optional
@@ -336,8 +338,8 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
     # Make sure pressure is monotonically decreasing
     sort_inds = np.argsort(pressure)[::-1]
     pressure = pressure[sort_inds]
-    if heights is not None:
-        heights = heights[sort_inds]
+    if height is not None:
+        height = height[sort_inds]
 
     # Bound is given in pressure
     if bound.dimensionality == {'[length]': -1.0, '[mass]': 1.0, '[time]': -2.0}:
@@ -346,33 +348,33 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
             bound_pressure = bound
             # If we have heights, we know the exact height value, otherwise return standard
             # atmosphere height for the pressure
-            if heights is not None:
-                bound_height = heights[pressure == bound_pressure]
+            if height is not None:
+                bound_height = height[pressure == bound_pressure]
             else:
                 bound_height = pressure_to_height_std(bound_pressure)
         # If bound is not in the data, return the nearest or interpolated values
         else:
             if interpolate:
                 bound_pressure = bound  # Use the user specified bound
-                if heights is not None:  # Interpolate heights from the height data
-                    bound_height = log_interpolate_1d(bound_pressure, pressure, heights)
+                if height is not None:  # Interpolate heights from the height data
+                    bound_height = log_interpolate_1d(bound_pressure, pressure, height)
                 else:  # If not heights given, use the standard atmosphere
                     bound_height = pressure_to_height_std(bound_pressure)
             else:  # No interpolation, find the closest values
                 idx = (np.abs(pressure - bound)).argmin()
                 bound_pressure = pressure[idx]
-                if heights is not None:
-                    bound_height = heights[idx]
+                if height is not None:
+                    bound_height = height[idx]
                 else:
                     bound_height = pressure_to_height_std(bound_pressure)
 
     # Bound is given in height
     elif bound.dimensionality == {'[length]': 1.0}:
         # If there is height data, see if we have the bound or need to interpolate/find nearest
-        if heights is not None:
-            if bound in heights:  # Bound is in the height data
+        if height is not None:
+            if bound in height:  # Bound is in the height data
                 bound_height = bound
-                bound_pressure = pressure[heights == bound]
+                bound_pressure = pressure[height == bound]
             else:  # Bound is not in the data
                 if interpolate:
                     bound_height = bound
@@ -380,13 +382,13 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
                     # Need to cast back to the input type since interp (up to at least numpy
                     # 1.13 always returns float64. This can cause upstream users problems,
                     # resulting in something like np.append() to upcast.
-                    bound_pressure = (np.interp(np.atleast_1d(bound.m), heights.m,
+                    bound_pressure = (np.interp(np.atleast_1d(bound.m), height.m,
                                                 pressure.m).astype(result_type(bound))
                                       * pressure.units)
                 else:
-                    idx = (np.abs(heights - bound)).argmin()
+                    idx = (np.abs(height - bound)).argmin()
                     bound_pressure = pressure[idx]
-                    bound_height = heights[idx]
+                    bound_height = height[idx]
         else:  # Don't have heights, so assume a standard atmosphere
             bound_height = bound
             bound_pressure = height_to_pressure_std(bound)
@@ -405,11 +407,10 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
     if not (_greater_or_close(bound_pressure, np.nanmin(pressure.m) * pressure.units)
             and _less_or_close(bound_pressure, np.nanmax(pressure.m) * pressure.units)):
         raise ValueError('Specified bound is outside pressure range.')
-    if heights is not None and not (_less_or_close(bound_height,
-                                                   np.nanmax(heights.m) * heights.units)
-                                    and _greater_or_close(bound_height,
-                                                          np.nanmin(heights.m)
-                                                          * heights.units)):
+    if height is not None and not (_less_or_close(bound_height,
+                                                  np.nanmax(height.m) * height.units)
+                                   and _greater_or_close(bound_height,
+                                                         np.nanmin(height.m) * height.units)):
         raise ValueError('Specified bound is outside height range.')
 
     return bound_pressure, bound_height
@@ -418,16 +419,16 @@ def _get_bound_pressure_height(pressure, bound, heights=None, interpolate=True):
 @exporter.export
 @preprocess_xarray
 @check_units('[length]')
-def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with_agl=False):
+def get_layer_heights(height, depth, *args, bottom=None, interpolate=True, with_agl=False):
     """Return an atmospheric layer from upper air data with the requested bottom and depth.
 
     This function will subset an upper air dataset to contain only the specified layer using
-    the heights only.
+    the height only.
 
     Parameters
     ----------
-    heights : array-like
-        Atmospheric heights
+    height : array-like
+        Atmospheric height
     depth : `pint.Quantity`
         The thickness of the layer
     args : array-like
@@ -438,8 +439,8 @@ def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with
         Interpolate the top and bottom points if they are not in the given data. Defaults
         to True.
     with_agl : bool, optional
-        Returns the heights as above ground level by subtracting the minimum height in the
-        provided heights. Defaults to False.
+        Returns the height as above ground level by subtracting the minimum height in the
+        provided height. Defaults to False.
 
     Returns
     -------
@@ -449,20 +450,20 @@ def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with
     """
     # Make sure pressure and datavars are the same length
     for datavar in args:
-        if len(heights) != len(datavar):
+        if len(height) != len(datavar):
             raise ValueError('Height and data variables must have the same length.')
 
     # If we want things in AGL, subtract the minimum height from all height values
     if with_agl:
-        sfc_height = np.min(heights)
-        heights = heights - sfc_height
+        sfc_height = np.min(height)
+        height = height - sfc_height
 
     # If the bottom is not specified, make it the surface
     if bottom is None:
-        bottom = heights[0]
+        bottom = height[0]
 
     # Make heights and arguments base units
-    heights = heights.to_base_units()
+    height = height.to_base_units()
     bottom = bottom.to_base_units()
 
     # Calculate the top of the layer
@@ -471,22 +472,22 @@ def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with
     ret = []  # returned data variables in layer
 
     # Ensure heights are sorted in ascending order
-    sort_inds = np.argsort(heights)
-    heights = heights[sort_inds]
+    sort_inds = np.argsort(height)
+    height = height[sort_inds]
 
     # Mask based on top and bottom
-    inds = _greater_or_close(heights, bottom) & _less_or_close(heights, top)
-    heights_interp = heights[inds]
+    inds = _greater_or_close(height, bottom) & _less_or_close(height, top)
+    heights_interp = height[inds]
 
     # Interpolate heights at bounds if necessary and sort
     if interpolate:
         # If we don't have the bottom or top requested, append them
         if top not in heights_interp:
             heights_interp = units.Quantity(np.sort(np.append(heights_interp.m, top.m)),
-                                            heights.units)
+                                            height.units)
         if bottom not in heights_interp:
             heights_interp = units.Quantity(np.sort(np.append(heights_interp.m, bottom.m)),
-                                            heights.units)
+                                            height.units)
 
     ret.append(heights_interp)
 
@@ -496,7 +497,7 @@ def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with
 
         if interpolate:
             # Interpolate for the possibly missing bottom/top values
-            datavar_interp = interpolate_1d(heights_interp, heights, datavar)
+            datavar_interp = interpolate_1d(heights_interp, height, datavar)
             datavar = datavar_interp
         else:
             datavar = datavar[inds]
@@ -508,7 +509,7 @@ def get_layer_heights(heights, depth, *args, bottom=None, interpolate=True, with
 @exporter.export
 @preprocess_xarray
 @check_units('[pressure]')
-def get_layer(pressure, *args, heights=None, bottom=None, depth=100 * units.hPa,
+def get_layer(pressure, *args, height=None, bottom=None, depth=100 * units.hPa,
               interpolate=True):
     r"""Return an atmospheric layer from upper air data with the requested bottom and depth.
 
@@ -524,9 +525,9 @@ def get_layer(pressure, *args, heights=None, bottom=None, depth=100 * units.hPa,
         Atmospheric pressure profile
     args : array-like
         Atmospheric variable(s) measured at the given pressures
-    heights: array-like, optional
+    height: array-like, optional
         Atmospheric heights corresponding to the given pressures. Defaults to using
-        heights calculated from ``p`` assuming a standard atmosphere [NOAA1976]_.
+        heights calculated from ``pressure`` assuming a standard atmosphere [NOAA1976]_.
     bottom : `pint.Quantity`, optional
         The bottom of the layer as a pressure or height above the surface pressure. Defaults
         to the highest pressure or lowest height given.
@@ -557,7 +558,7 @@ def get_layer(pressure, *args, heights=None, bottom=None, depth=100 * units.hPa,
         bottom = np.nanmax(pressure.m) * pressure.units
 
     bottom_pressure, bottom_height = _get_bound_pressure_height(pressure, bottom,
-                                                                heights=heights,
+                                                                height=height,
                                                                 interpolate=interpolate)
 
     # Calculate the top if whatever units depth is in
@@ -568,7 +569,7 @@ def get_layer(pressure, *args, heights=None, bottom=None, depth=100 * units.hPa,
     else:
         raise ValueError('Depth must be specified in units of length or pressure')
 
-    top_pressure, _ = _get_bound_pressure_height(pressure, top, heights=heights,
+    top_pressure, _ = _get_bound_pressure_height(pressure, top, height=height,
                                                  interpolate=interpolate)
 
     ret = []  # returned data variables in layer
@@ -655,7 +656,7 @@ def find_bounding_indices(arr, values, axis, from_below=True):
     good = np.empty(indices_shape, dtype=np.bool)
 
     # Used to put the output in the proper location
-    store_slice = [slice(None)] * arr.ndim
+    take = make_take(arr.ndim, axis)
 
     # Loop over all of the values and for each, see where the value would be found from a
     # linear search
@@ -685,9 +686,9 @@ def find_bounding_indices(arr, values, axis, from_below=True):
         index[~good_search] = 0
 
         # Put the results in the proper slice
-        store_slice[axis] = level_index
-        indices[tuple(store_slice)] = index
-        good[tuple(store_slice)] = good_search
+        store_slice = take(level_index)
+        indices[store_slice] = index
+        good[store_slice] = good_search
 
     # Create index values for broadcasting arrays
     above = broadcast_indices(arr, indices, arr.ndim, axis)
@@ -740,20 +741,31 @@ def _less_or_close(a, value, **kwargs):
     return (a < value) | np.isclose(a, value, **kwargs)
 
 
+def make_take(ndims, slice_dim):
+    """Generate a take function to index in a particular dimension."""
+    def take(indexer):
+        return tuple(indexer if slice_dim % ndims == i else slice(None)  # noqa: S001
+                     for i in range(ndims))
+    return take
+
+
 @exporter.export
 @preprocess_xarray
-def lat_lon_grid_deltas(longitude, latitude, **kwargs):
-    r"""Calculate the delta between grid points that are in a latitude/longitude format.
-
-    Calculate the signed delta distance between grid points when the grid spacing is defined by
-    delta lat/lon rather than delta x/y
+def lat_lon_grid_deltas(longitude, latitude, y_dim=-2, x_dim=-1, **kwargs):
+    r"""Calculate the actual delta between grid points that are in latitude/longitude format.
 
     Parameters
     ----------
     longitude : array_like
-        array of longitudes defining the grid
+        array of longitudes defining the grid. If not a `pint.Quantity`, assumed to be in
+        degrees.
     latitude : array_like
-        array of latitudes defining the grid
+        array of latitudes defining the grid. If not a `pint.Quantity`, assumed to be in
+        degrees.
+    y_dim : int
+        axis number for the y dimesion, defaults to -2.
+    x_dim: int
+        axis number for the x dimension, defaults to -1.
     kwargs
         Other keyword arguments to pass to :class:`~pyproj.Geod`
 
@@ -766,7 +778,8 @@ def lat_lon_grid_deltas(longitude, latitude, **kwargs):
     Notes
     -----
     Accepts 1D, 2D, or higher arrays for latitude and longitude
-    Assumes [..., Y, X] for >=2 dimensional arrays
+    Assumes [..., Y, X] dimension order for input and output, unless keyword arguments `y_dim`
+    and `x_dim` are otherwise specified.
 
     """
     from pyproj import Geod
@@ -787,35 +800,48 @@ def lat_lon_grid_deltas(longitude, latitude, **kwargs):
         longitude = np.asarray(longitude)
         latitude = np.asarray(latitude)
 
+    # Determine dimension order for offset slicing
+    take_y = make_take(latitude.ndim, y_dim)
+    take_x = make_take(latitude.ndim, x_dim)
+
     geod_args = {'ellps': 'sphere'}
     if kwargs:
         geod_args = kwargs
 
     g = Geod(**geod_args)
 
-    forward_az, _, dy = g.inv(longitude[..., :-1, :], latitude[..., :-1, :],
-                              longitude[..., 1:, :], latitude[..., 1:, :])
+    forward_az, _, dy = g.inv(longitude[take_y(slice(None, -1))],
+                              latitude[take_y(slice(None, -1))],
+                              longitude[take_y(slice(1, None))],
+                              latitude[take_y(slice(1, None))])
     dy[(forward_az < -90.) | (forward_az > 90.)] *= -1
 
-    forward_az, _, dx = g.inv(longitude[..., :, :-1], latitude[..., :, :-1],
-                              longitude[..., :, 1:], latitude[..., :, 1:])
+    forward_az, _, dx = g.inv(longitude[take_x(slice(None, -1))],
+                              latitude[take_x(slice(None, -1))],
+                              longitude[take_x(slice(1, None))],
+                              latitude[take_x(slice(1, None))])
     dx[(forward_az < 0.) | (forward_az > 180.)] *= -1
 
     return dx * units.meter, dy * units.meter
 
 
 @exporter.export
-def grid_deltas_from_dataarray(f):
+def grid_deltas_from_dataarray(f, kind='default'):
     """Calculate the horizontal deltas between grid points of a DataArray.
 
     Calculate the signed delta distance between grid points of a DataArray in the horizontal
-    directions, whether the grid is lat/lon or x/y.
+    directions, using actual (real distance) or nominal (in projection space) deltas.
 
     Parameters
     ----------
     f : `xarray.DataArray`
-        Parsed DataArray on a latitude/longitude grid, in (..., lat, lon) or (..., y, x)
-        dimension order
+        Parsed DataArray (MetPy's crs coordinate must be available for kind="actual")
+    kind : str
+        Type of grid delta to calculate. "actual" returns true distances as calculated from
+        longitude and latitude via `lat_lon_grid_deltas`. "nominal" returns horizontal
+        differences in the data's coordinate space, either in degrees (for lat/lon CRS) or
+        meters (for y/x CRS). "default" behaves like "actual" for datasets with a lat/lon CRS
+        and like "nominal" for all others. Defaults to "default".
 
     Returns
     -------
@@ -828,17 +854,45 @@ def grid_deltas_from_dataarray(f):
     lat_lon_grid_deltas
 
     """
-    if f.metpy.crs['grid_mapping_name'] == 'latitude_longitude':
-        dx, dy = lat_lon_grid_deltas(f.metpy.x, f.metpy.y,
-                                     initstring=f.metpy.cartopy_crs.proj4_init)
-        slc_x = slc_y = tuple([np.newaxis] * (f.ndim - 2) + [slice(None)] * 2)
+    # Determine behavior
+    if kind == 'default' and f.metpy.crs['grid_mapping_name'] == 'latitude_longitude':
+        kind = 'actual'
+    elif kind == 'default':
+        kind = 'nominal'
+    elif kind not in ('actual', 'nominal'):
+        raise ValueError('"kind" argument must be specified as "default", "actual", or '
+                         '"nominal"')
+
+    if kind == 'actual':
+        # Get latitude/longitude coordinates and find dim order
+        latitude, longitude = xr.broadcast(*f.metpy.coordinates('latitude', 'longitude'))
+        try:
+            y_dim = latitude.metpy.find_axis_number('y')
+            x_dim = latitude.metpy.find_axis_number('x')
+        except AttributeError:
+            warnings.warn('y and x dimensions unable to be identified. Assuming [..., y, x] '
+                          'dimension order.')
+            y_dim, x_dim = -2, -1
+        # Obtain grid deltas as xarray Variables
+        (dx_var, dx_units), (dy_var, dy_units) = (
+            (xr.Variable(dims=latitude.dims, data=deltas.magnitude), deltas.units)
+            for deltas in lat_lon_grid_deltas(longitude, latitude, y_dim=y_dim, x_dim=x_dim,
+                                              initstring=f.metpy.cartopy_crs.proj4_init))
     else:
-        dx = np.diff(f.metpy.x.metpy.unit_array.to('m').magnitude) * units('m')
-        dy = np.diff(f.metpy.y.metpy.unit_array.to('m').magnitude) * units('m')
-        slc = [np.newaxis] * (f.ndim - 2)
-        slc_x = tuple(slc + [np.newaxis, slice(None)])
-        slc_y = tuple(slc + [slice(None), np.newaxis])
-    return dx[slc_x], dy[slc_y]
+        # Obtain y/x coordinate differences
+        y, x = f.metpy.coordinates('y', 'x')
+        dx_var = x.diff(x.dims[0]).variable
+        dx_units = units(x.attrs.get('units'))
+        dy_var = y.diff(y.dims[0]).variable
+        dy_units = units(y.attrs.get('units'))
+
+    # Broadcast to input and attach units
+    dx = dx_var.set_dims(f.dims, shape=[dx_var.sizes[dim] if dim in dx_var.dims else 1
+                                        for dim in f.dims]).data * dx_units
+    dy = dy_var.set_dims(f.dims, shape=[dy_var.sizes[dim] if dim in dy_var.dims else 1
+                                        for dim in f.dims]).data * dy_units
+
+    return dx, dy
 
 
 def xarray_derivative_wrap(func):
@@ -912,7 +966,8 @@ def first_derivative(f, **kwargs):
         integer. If `f` is a `DataArray`, can be a string (referring to either the coordinate
         dimension name or the axis type) or integer (referring to axis number), unless using
         implicit conversion to `pint.Quantity`, in which case it must be an integer. Defaults
-        to 0.
+        to 0. For reference, the current standard axis types are 'time', 'vertical', 'y', and
+        'x'.
     x : array-like, optional
         The coordinate values corresponding to the grid points in `f`.
     delta : array-like, optional
@@ -930,61 +985,46 @@ def first_derivative(f, **kwargs):
 
     """
     n, axis, delta = _process_deriv_args(f, kwargs)
-
-    # create slice objects --- initially all are [:, :, ..., :]
-    slice0 = [slice(None)] * n
-    slice1 = [slice(None)] * n
-    slice2 = [slice(None)] * n
-    delta_slice0 = [slice(None)] * n
-    delta_slice1 = [slice(None)] * n
+    take = make_take(n, axis)
 
     # First handle centered case
-    slice0[axis] = slice(None, -2)
-    slice1[axis] = slice(1, -1)
-    slice2[axis] = slice(2, None)
-    delta_slice0[axis] = slice(None, -1)
-    delta_slice1[axis] = slice(1, None)
+    slice0 = take(slice(None, -2))
+    slice1 = take(slice(1, -1))
+    slice2 = take(slice(2, None))
+    delta_slice0 = take(slice(None, -1))
+    delta_slice1 = take(slice(1, None))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    delta_diff = delta[tuple(delta_slice1)] - delta[tuple(delta_slice0)]
-    center = (- delta[tuple(delta_slice1)] / (combined_delta * delta[tuple(delta_slice0)])
-              * f[tuple(slice0)]
-              + delta_diff / (delta[tuple(delta_slice0)] * delta[tuple(delta_slice1)])
-              * f[tuple(slice1)]
-              + delta[tuple(delta_slice0)] / (combined_delta * delta[tuple(delta_slice1)])
-              * f[tuple(slice2)])
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    delta_diff = delta[delta_slice1] - delta[delta_slice0]
+    center = (- delta[delta_slice1] / (combined_delta * delta[delta_slice0]) * f[slice0]
+              + delta_diff / (delta[delta_slice0] * delta[delta_slice1]) * f[slice1]
+              + delta[delta_slice0] / (combined_delta * delta[delta_slice1]) * f[slice2])
 
     # Fill in "left" edge with forward difference
-    slice0[axis] = slice(None, 1)
-    slice1[axis] = slice(1, 2)
-    slice2[axis] = slice(2, 3)
-    delta_slice0[axis] = slice(None, 1)
-    delta_slice1[axis] = slice(1, 2)
+    slice0 = take(slice(None, 1))
+    slice1 = take(slice(1, 2))
+    slice2 = take(slice(2, 3))
+    delta_slice0 = take(slice(None, 1))
+    delta_slice1 = take(slice(1, 2))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    big_delta = combined_delta + delta[tuple(delta_slice0)]
-    left = (- big_delta / (combined_delta * delta[tuple(delta_slice0)])
-            * f[tuple(slice0)]
-            + combined_delta / (delta[tuple(delta_slice0)] * delta[tuple(delta_slice1)])
-            * f[tuple(slice1)]
-            - delta[tuple(delta_slice0)] / (combined_delta * delta[tuple(delta_slice1)])
-            * f[tuple(slice2)])
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    big_delta = combined_delta + delta[delta_slice0]
+    left = (- big_delta / (combined_delta * delta[delta_slice0]) * f[slice0]
+            + combined_delta / (delta[delta_slice0] * delta[delta_slice1]) * f[slice1]
+            - delta[delta_slice0] / (combined_delta * delta[delta_slice1]) * f[slice2])
 
     # Now the "right" edge with backward difference
-    slice0[axis] = slice(-3, -2)
-    slice1[axis] = slice(-2, -1)
-    slice2[axis] = slice(-1, None)
-    delta_slice0[axis] = slice(-2, -1)
-    delta_slice1[axis] = slice(-1, None)
+    slice0 = take(slice(-3, -2))
+    slice1 = take(slice(-2, -1))
+    slice2 = take(slice(-1, None))
+    delta_slice0 = take(slice(-2, -1))
+    delta_slice1 = take(slice(-1, None))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    big_delta = combined_delta + delta[tuple(delta_slice1)]
-    right = (delta[tuple(delta_slice1)] / (combined_delta * delta[tuple(delta_slice0)])
-             * f[tuple(slice0)]
-             - combined_delta / (delta[tuple(delta_slice0)] * delta[tuple(delta_slice1)])
-             * f[tuple(slice1)]
-             + big_delta / (combined_delta * delta[tuple(delta_slice1)])
-             * f[tuple(slice2)])
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    big_delta = combined_delta + delta[delta_slice1]
+    right = (delta[delta_slice1] / (combined_delta * delta[delta_slice0]) * f[slice0]
+             - combined_delta / (delta[delta_slice0] * delta[delta_slice1]) * f[slice1]
+             + big_delta / (combined_delta * delta[delta_slice1]) * f[slice2])
 
     return concatenate((left, center, right), axis=axis)
 
@@ -1016,7 +1056,8 @@ def second_derivative(f, **kwargs):
         integer. If `f` is a `DataArray`, can be a string (referring to either the coordinate
         dimension name or the axis type) or integer (referring to axis number), unless using
         implicit conversion to `pint.Quantity`, in which case it must be an integer. Defaults
-        to 0.
+        to 0. For reference, the current standard axis types are 'time', 'vertical', 'y', and
+        'x'.
     x : array-like, optional
         The coordinate values corresponding to the grid points in `f`.
     delta : array-like, optional
@@ -1034,50 +1075,43 @@ def second_derivative(f, **kwargs):
 
     """
     n, axis, delta = _process_deriv_args(f, kwargs)
-
-    # create slice objects --- initially all are [:, :, ..., :]
-    slice0 = [slice(None)] * n
-    slice1 = [slice(None)] * n
-    slice2 = [slice(None)] * n
-    delta_slice0 = [slice(None)] * n
-    delta_slice1 = [slice(None)] * n
+    take = make_take(n, axis)
 
     # First handle centered case
-    slice0[axis] = slice(None, -2)
-    slice1[axis] = slice(1, -1)
-    slice2[axis] = slice(2, None)
-    delta_slice0[axis] = slice(None, -1)
-    delta_slice1[axis] = slice(1, None)
+    slice0 = take(slice(None, -2))
+    slice1 = take(slice(1, -1))
+    slice2 = take(slice(2, None))
+    delta_slice0 = take(slice(None, -1))
+    delta_slice1 = take(slice(1, None))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    center = 2 * (f[tuple(slice0)] / (combined_delta * delta[tuple(delta_slice0)])
-                  - f[tuple(slice1)] / (delta[tuple(delta_slice0)]
-                                        * delta[tuple(delta_slice1)])
-                  + f[tuple(slice2)] / (combined_delta * delta[tuple(delta_slice1)]))
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    center = 2 * (f[slice0] / (combined_delta * delta[delta_slice0])
+                  - f[slice1] / (delta[delta_slice0] * delta[delta_slice1])
+                  + f[slice2] / (combined_delta * delta[delta_slice1]))
 
     # Fill in "left" edge
-    slice0[axis] = slice(None, 1)
-    slice1[axis] = slice(1, 2)
-    slice2[axis] = slice(2, 3)
-    delta_slice0[axis] = slice(None, 1)
-    delta_slice1[axis] = slice(1, 2)
+    slice0 = take(slice(None, 1))
+    slice1 = take(slice(1, 2))
+    slice2 = take(slice(2, 3))
+    delta_slice0 = take(slice(None, 1))
+    delta_slice1 = take(slice(1, 2))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    left = 2 * (f[tuple(slice0)] / (combined_delta * delta[tuple(delta_slice0)])
-                - f[tuple(slice1)] / (delta[tuple(delta_slice0)] * delta[tuple(delta_slice1)])
-                + f[tuple(slice2)] / (combined_delta * delta[tuple(delta_slice1)]))
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    left = 2 * (f[slice0] / (combined_delta * delta[delta_slice0])
+                - f[slice1] / (delta[delta_slice0] * delta[delta_slice1])
+                + f[slice2] / (combined_delta * delta[delta_slice1]))
 
     # Now the "right" edge
-    slice0[axis] = slice(-3, -2)
-    slice1[axis] = slice(-2, -1)
-    slice2[axis] = slice(-1, None)
-    delta_slice0[axis] = slice(-2, -1)
-    delta_slice1[axis] = slice(-1, None)
+    slice0 = take(slice(-3, -2))
+    slice1 = take(slice(-2, -1))
+    slice2 = take(slice(-1, None))
+    delta_slice0 = take(slice(-2, -1))
+    delta_slice1 = take(slice(-1, None))
 
-    combined_delta = delta[tuple(delta_slice0)] + delta[tuple(delta_slice1)]
-    right = 2 * (f[tuple(slice0)] / (combined_delta * delta[tuple(delta_slice0)])
-                 - f[tuple(slice1)] / (delta[tuple(delta_slice0)] * delta[tuple(delta_slice1)])
-                 + f[tuple(slice2)] / (combined_delta * delta[tuple(delta_slice1)]))
+    combined_delta = delta[delta_slice0] + delta[delta_slice1]
+    right = 2 * (f[slice0] / (combined_delta * delta[delta_slice0])
+                 - f[slice1] / (delta[delta_slice0] * delta[delta_slice1])
+                 + f[slice2] / (combined_delta * delta[delta_slice1]))
 
     return concatenate((left, center, right), axis=axis)
 
@@ -1111,7 +1145,9 @@ def gradient(f, **kwargs):
         `pint.Quantity` is not used) or integers that specify the array axes along which to
         take the derivatives. Defaults to all axes of `f`. If given, and used with
         `coordinates` or `deltas`, its length must be less than or equal to that of the
-        `coordinates` or `deltas` given.
+        `coordinates` or `deltas` given. In general, each axis can be an axis number
+        (integer), dimension coordinate name (string) or a standard axis type (string). The
+        current standard axis types are 'time', 'vertical', 'y', and 'x'.
 
     Returns
     -------
@@ -1160,7 +1196,9 @@ def laplacian(f, **kwargs):
         `pint.Quantity` is not used) or integers that specify the array axes along which to
         take the derivatives. Defaults to all axes of `f`. If given, and used with
         `coordinates` or `deltas`, its length must be less than or equal to that of the
-        `coordinates` or `deltas` given.
+        `coordinates` or `deltas` given. In general, each axis can be an axis number
+        (integer), dimension coordinate name (string) or a standard axis type (string). The
+        current standard axis types are 'time', 'vertical', 'y', and 'x'.
 
     Returns
     -------
@@ -1238,7 +1276,7 @@ def _process_deriv_args(f, kwargs):
         if 'x' in kwargs:
             raise ValueError('Cannot specify both "x" and "delta".')
 
-        delta = atleast_1d(kwargs['delta'])
+        delta = np.atleast_1d(kwargs['delta'])
         if delta.size == 1:
             diff_size = list(f.shape)
             diff_size[axis] -= 1
@@ -1250,7 +1288,7 @@ def _process_deriv_args(f, kwargs):
             delta = _broadcast_to_axis(delta, axis, n)
     elif 'x' in kwargs:
         x = _broadcast_to_axis(kwargs['x'], axis, n)
-        delta = diff(x, axis=axis)
+        delta = np.diff(x, axis=axis)
     else:
         raise ValueError('Must specify either "x" or "delta" for value positions.')
 
@@ -1437,3 +1475,146 @@ def _remove_nans(*variables):
     for v in variables:
         ret.append(v[~mask])
     return ret
+
+
+def wrap_output_like(**wrap_kwargs):
+    """Wrap the output from a function to be like some other data object type.
+
+    Wraps given data to match the units/coordinates/object type of another array. Currently
+    supports:
+
+    - As input (output from wrapped function):
+
+        * ``pint.Quantity``
+        * ``xarray.DataArray``
+        * any type wrappable by ``pint.Quantity``
+
+    - As matched output (final returned value):
+
+        * ``pint.Quantity``
+        * ``xarray.DataArray`` wrapping a ``pint.Quantity``
+
+    (if matched output is not one of these types, we instead treat the match as if it was a
+    dimenionless Quantity.)
+
+    This wrapping/conversion follows the following rules:
+
+    - If match_unit is False, for output of Quantity or DataArary respectively,
+
+        * ndarray becomes dimensionless Quantity or unitless DataArray with matching coords
+        * Quantity is unchanged or becomes DataArray with input units and output coords
+        * DataArray is converted to Quantity by accessor or is unchanged
+
+    - If match_unit is True, for output of Quantity or DataArary respectively, with a given
+      unit,
+
+        * ndarray becomes Quantity or DataArray (with matching coords) with output unit
+        * Quantity is converted to output unit, then returned or converted to DataArray with
+          matching coords
+        * DataArray is has units converted via the accessor, then converted to Quantity via
+          the accessor or returned
+
+    The output to match can be specified two ways:
+
+    - Using the `argument` keyword argument, the output is taken from argument of that name
+      from the wrapped function's signature
+    - Using the `other` keyword argument, the output is given directly
+
+    Parameters
+    ----------
+    argument : str
+        specify the name of a single argument from the function signature from which
+        to take the other data object
+    other : `numpy.ndarray` or `pint.Quantity` or `xarray.DataArray`
+        specify the other data object directly
+    match_unit : bool
+        if True and other data object has units, convert output to those units
+        (defaults to False)
+
+    Notes
+    -----
+    This can be extended in the future to support:
+
+    - ``units.wraps``-like behavior
+    - Python scalars vs. NumPy scalars (Issue #1209)
+    - dask (and other duck array) compatibility
+    - dimensionality reduction (particularly with xarray)
+
+    See Also
+    --------
+    preprocess_xarray
+
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Determine other
+            if 'other' in wrap_kwargs:
+                other = wrap_kwargs['other']
+            elif 'argument' in wrap_kwargs:
+                other = signature(func).bind(*args, **kwargs).arguments[
+                    wrap_kwargs['argument']]
+            else:
+                raise ValueError('Must specify keyword "other" or "argument".')
+
+            # Get result from wrapped function
+            result = func(*args, **kwargs)
+
+            # Proceed with wrapping rules
+            if wrap_kwargs.get('match_unit', False):
+                return _wrap_output_like_matching_units(result, other)
+            else:
+                return _wrap_output_like_not_matching_units(result, other)
+
+        return wrapper
+    return decorator
+
+
+def _wrap_output_like_matching_units(result, match):
+    """Convert result to be like match with matching units for output wrapper."""
+    if isinstance(match, xr.DataArray):
+        output_xarray = True
+        match_units = match.metpy.units
+    elif isinstance(match, units.Quantity):
+        output_xarray = False
+        match_units = match.units
+    else:
+        output_xarray = False
+        match_units = ''
+
+    if isinstance(result, xr.DataArray):
+        result = result.metpy.convert_units(match_units)
+        return result.metpy.quantify() if output_xarray else result.metpy.unit_array
+    else:
+        result = result.m_as(match_units) if isinstance(result, units.Quantity) else result
+        if output_xarray:
+            return xr.DataArray(
+                units.Quantity(result, match_units),
+                dims=match.dims,
+                coords=match.coords
+            )
+        else:
+            return units.Quantity(result, match_units)
+
+
+def _wrap_output_like_not_matching_units(result, match):
+    """Convert result to be like match without matching units for output wrapper."""
+    output_xarray = isinstance(match, xr.DataArray)
+    if isinstance(result, xr.DataArray):
+        return result.metpy.quantify() if output_xarray else result.metpy.unit_array
+    else:
+        if isinstance(result, units.Quantity):
+            result_magnitude = result.magnitude
+            result_units = str(result.units)
+        else:
+            result_magnitude = result
+            result_units = ''
+
+        if output_xarray:
+            return xr.DataArray(
+                units.Quantity(result_magnitude, result_units),
+                dims=match.dims,
+                coords=match.coords
+            )
+        else:
+            return units.Quantity(result_magnitude, result_units)

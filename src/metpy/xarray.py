@@ -20,16 +20,15 @@ import logging
 import re
 import warnings
 
+import cartopy.crs as ccrs
 import numpy as np
 import xarray as xr
 
 from ._vendor.xarray import either_dict_or_kwargs, expanded_indexer, is_dict_like
-from .deprecation import metpyDeprecation
 from .units import DimensionalityError, UndefinedUnitError, units
 
 __all__ = []
 metpy_axes = ['time', 'vertical', 'y', 'latitude', 'x', 'longitude']
-cf_to_metpy_axes = {'T': 'time', 'Z': 'vertical', 'Y': 'y', 'X': 'x'}  # TODO: Remove in 1.0
 
 # Define the criteria for coordinate matches
 coordinate_criteria = {
@@ -93,6 +92,9 @@ coordinate_criteria = {
 
 log = logging.getLogger(__name__)
 
+_axis_identifier_error = ('Given axis is not valid. Must be an axis number, a dimension '
+                          'coordinate name, or a standard axis type.')
+
 
 @xr.register_dataarray_accessor('metpy')
 class MetPyDataArrayAccessor:
@@ -103,9 +105,9 @@ class MetPyDataArrayAccessor:
     to a particular axis (given sufficent metadata):
 
         >>> import xarray as xr
-        >>> temperature = xr.DataArray([[0, 1], [2, 3]], dims=('lat', 'lon'),
-        ...                            coords={'lat': [40, 41], 'lon': [-105, -104]},
-        ...                            attrs={'units': 'degC'})
+        >>> from metpy.units import units
+        >>> temperature = xr.DataArray([[0, 1], [2, 3]] * units.degC, dims=('lat', 'lon'),
+        ...                            coords={'lat': [40, 41], 'lon': [-105, -104]})
         >>> temperature.metpy.x
         <xarray.DataArray 'lon' (lon: 2)>
         array([-105, -104])
@@ -119,30 +121,68 @@ class MetPyDataArrayAccessor:
     def __init__(self, data_array):  # noqa: D107
         # Initialize accessor with a DataArray. (Do not use directly).
         self._data_array = data_array
-        self._units = self._data_array.attrs.get('units', 'dimensionless')
 
     @property
     def units(self):
-        """Return the units of this DataArray as a `pint.Quantity`."""
-        if self._units != '%':
-            return units(self._units)
+        """Return the units of this DataArray as a `pint.Unit`."""
+        if isinstance(self._data_array.data, units.Quantity):
+            return self._data_array.data.units
         else:
-            return units('percent')
+            return units.parse_units(self._data_array.attrs.get('units', 'dimensionless'))
+
+    @property
+    def magnitude(self):
+        """Return the magnitude of the data values of this DataArray (i.e., without units)."""
+        if isinstance(self._data_array.data, units.Quantity):
+            return self._data_array.data.magnitude
+        else:
+            return self._data_array.data
 
     @property
     def unit_array(self):
         """Return the data values of this DataArray as a `pint.Quantity`."""
-        return self._data_array.values * self.units
-
-    @unit_array.setter
-    def unit_array(self, values):
-        """Set data values from a `pint.Quantity`."""
-        self._data_array.values = values.magnitude
-        self._units = self._data_array.attrs['units'] = str(values.units)
+        if isinstance(self._data_array.data, units.Quantity):
+            return self._data_array.data
+        else:
+            return units.Quantity(self._data_array.values, self.units)
 
     def convert_units(self, units):
-        """Convert the data values to different units in-place."""
-        self.unit_array = self.unit_array.to(units)
+        """Return new DataArray with values converted to different units."""
+        return self.quantify().copy(data=self.unit_array.to(units))
+
+    def convert_coordinate_units(self, coord, units):
+        """Return new DataArray with coordinate converted to different units."""
+        new_coord_var = self._data_array[coord].copy(
+            data=self._data_array[coord].metpy.unit_array.m_as(units)
+        )
+        new_coord_var.attrs['units'] = str(units)
+        return self._data_array.assign_coords(coords={coord: new_coord_var})
+
+    def quantify(self):
+        """Return a DataArray with the data converted to a `pint.Quantity`."""
+        if (
+            not isinstance(self._data_array.data, units.Quantity)
+            and np.issubdtype(self._data_array.data.dtype, np.number)
+        ):
+            # Only quantify if not already quantified and is quantifiable
+            quantified_dataarray = self._data_array.copy(data=self.unit_array)
+            if 'units' in quantified_dataarray.attrs:
+                del quantified_dataarray.attrs['units']
+        else:
+            quantified_dataarray = self._data_array
+        return quantified_dataarray
+
+    def dequantify(self):
+        """Return a DataArray with the data as magnitude and the units as an attribute."""
+        if isinstance(self._data_array.data, units.Quantity):
+            # Only dequantify if quantified
+            dequantified_dataarray = self._data_array.copy(
+                data=self._data_array.data.magnitude
+            )
+            dequantified_dataarray.attrs['units'] = str(self.units)
+        else:
+            dequantified_dataarray = self._data_array
+        return dequantified_dataarray
 
     @property
     def crs(self):
@@ -167,15 +207,6 @@ class MetPyDataArrayAccessor:
             if coord_map[axis] is not None and not isinstance(coord_map[axis], xr.DataArray):
                 coord_map[axis] = self._data_array[coord_map[axis]]
 
-        # Adapt to old CF axis dict keys
-        # TODO: Remove in v1.0
-        if any(cf_axis in coord_map for cf_axis in cf_to_metpy_axes):
-            warnings.warn('The use of CF axes types in the coordinate mapping has been '
-                          'deprecated and will be removed in v1.0.', metpyDeprecation)
-            coord_map = {(cf_to_metpy_axes[axis]
-                          if axis in cf_to_metpy_axes else axis): coord
-                         for axis, coord in coord_map.items()}
-
         return coord_map
 
     def assign_coordinates(self, coordinates):
@@ -189,12 +220,6 @@ class MetPyDataArrayAccessor:
             their name. If ``None``, clears the `_metpy_axis` attribute on all coordinates,
             which will trigger reparsing of all coordinates on next access.
 
-        Notes
-        -----
-        Prior to v0.12, ``coordinates`` was taken as a mapping from CF axis types
-        ('T', 'Z', 'Y', 'X') to coordinates. This behavior has been deprecated and will be
-        be removed in v1.0.
-
         """
         if coordinates:
             # Assign the _metpy_axis attributes according to supplied mapping
@@ -206,6 +231,8 @@ class MetPyDataArrayAccessor:
             # Clear _metpy_axis attribute on all coordinates
             for coord_var in self._data_array.coords.values():
                 coord_var.attrs.pop('_metpy_axis', None)
+
+        return self._data_array  # allow method chaining
 
     def _generate_coordinate_map(self):
         """Generate a coordinate map via CF conventions and other methods."""
@@ -226,7 +253,7 @@ class MetPyDataArrayAccessor:
                 coord_lists[geometric] = coord_lists[graticule]
 
         # Filter out multidimensional coordinates where not allowed
-        require_1d_coord = ['time', 'vertical']  # TODO: Add 'y', 'x' in v1.0
+        require_1d_coord = ['time', 'vertical', 'y', 'x']
         for axis in require_1d_coord:
             coord_lists[axis] = [coord for coord in coord_lists[axis] if coord.ndim <= 1]
 
@@ -249,8 +276,10 @@ class MetPyDataArrayAccessor:
             return
 
         # Ambiguous axis, raise warning and do not parse
-        warnings.warn('More than one ' + axis + ' coordinate present for variable "'
-                      + self._data_array.name + '".')
+        varname = (' "' + self._data_array.name + '"'
+                   if self._data_array.name is not None else '')
+        warnings.warn('More than one ' + axis + ' coordinate present for variable'
+                      + varname + '.')
         coord_lists[axis] = []
 
     def _metpy_axis_search(self, metpy_axis):
@@ -267,13 +296,6 @@ class MetPyDataArrayAccessor:
             if (coord_var is not None
                 and not any(axis in coord.attrs.get('_metpy_axis', '').split(',')
                             for coord in coords)):
-                # Warn if assigning multidimensional coord to x/y
-                # TODO: Remove in v1.0
-                if coord_var.ndim > 1 and axis in ('y', 'x'):
-                    warnings.warn(f'Multidimensional coordinate {coord_var.name} assigned for '
-                                  f'axis "{axis}". This behavior has been deprecated and will '
-                                  'be removed in v1.0 (only one-dimensional coordinates will '
-                                  f'be available for the "{axis}" axis).', metpyDeprecation)
 
                 _assign_axis(coord_var.attrs, axis)
 
@@ -302,7 +324,7 @@ class MetPyDataArrayAccessor:
 
         Notes
         -----
-        This method is designed for use with mutliple coordinates; it returns a generator. To
+        This method is designed for use with multiple coordinates; it returns a generator. To
         access a single coordinate, use the appropriate attribute on the accessor, or use tuple
         unpacking.
 
@@ -322,15 +344,7 @@ class MetPyDataArrayAccessor:
 
     @property
     def y(self):
-        """Return the y coordinate.
-
-        Notes
-        -----
-        Prior to version v0.12, this attribute allowed multidimensional coordinates (including
-        latitude when another y coordinate was not available). This behavior has been
-        deprecated and will be removed in v1.0.
-
-        """
+        """Return the y coordinate."""
         return self._axis('y')
 
     @property
@@ -340,15 +354,7 @@ class MetPyDataArrayAccessor:
 
     @property
     def x(self):
-        """Return the x coordinate.
-
-        Notes
-        -----
-        Prior to version v0.12, this attribute allowed multidimensional coordinates (including
-        longitude when another x coordinate was not available). This behavior has been
-        deprecated and will be removed in v1.0.
-
-        """
+        """Return the x coordinate."""
         return self._axis('x')
 
     @property
@@ -370,27 +376,6 @@ class MetPyDataArrayAccessor:
         # Otherwise, they match.
         return True
 
-    def as_timestamp(self):
-        """Return the data as unix timestamp (for easier time derivatives).
-
-        Notes
-        -----
-        This function has been deprecated and will be removed in v1.0. For the purposes of
-        time derivatives, use ``time_deltas`` instead, which allows sub-second precision.
-
-        """
-        warnings.warn('This function has been deprecated and will be removed in v1.0. Use '
-                      'time_deltas instead.', metpyDeprecation)
-        attrs = {key: self._data_array.attrs[key] for key in
-                 {'standard_name', 'long_name', 'axis', '_metpy_axis'}
-                 & set(self._data_array.attrs)}
-        attrs['units'] = 'seconds'
-        return xr.DataArray(self._data_array.values.astype('datetime64[s]').astype('int64'),
-                            name=self._data_array.name,
-                            coords=self._data_array.coords,
-                            dims=self._data_array.dims,
-                            attrs=attrs)
-
     @property
     def time_deltas(self):
         """Return the time difference of the data in seconds (to microsecond precision)."""
@@ -403,7 +388,7 @@ class MetPyDataArrayAccessor:
         Parameters
         ----------
         axis : str or int
-            Identifier for an axis. Can be the an axis number (integer), dimension coordinate
+            Identifier for an axis. Can be an axis number (integer), dimension coordinate
             name (string) or a standard axis type (string).
 
         """
@@ -419,8 +404,47 @@ class MetPyDataArrayAccessor:
             return axis
         else:
             # Otherwise, not valid
-            raise ValueError('Given axis is not valid. Must be an axis number, a dimension '
-                             'coordinate name, or a standard axis type.')
+            raise ValueError(_axis_identifier_error)
+
+    def find_axis_number(self, axis):
+        """Return the dimension number of the axis corresponding to the given identifier.
+
+        Parameters
+        ----------
+        axis : str or int
+            Identifier for an axis. Can be an axis number (integer), dimension coordinate
+            name (string) or a standard axis type (string).
+
+        """
+        if isinstance(axis, int):
+            # If an integer, use it directly
+            return axis
+        elif axis in self._data_array.dims:
+            # Simply index into dims
+            return self._data_array.dims.index(axis)
+        elif axis in metpy_axes:
+            # If not a dimension name itself, but a valid axis type, first determine if this
+            # standard axis type is present as a dimension coordinate
+            try:
+                name = self._axis(axis).name
+                return self._data_array.dims.index(name)
+            except AttributeError as exc:
+                # If x or y requested, but x or y not available, attempt to interpret dim
+                # names using regular expressions from coordinate parsing to allow for
+                # multidimensional lat/lon without y/x dimension coordinates
+                if axis in ('y', 'x'):
+                    for i, dim in enumerate(self._data_array.dims):
+                        if re.match(coordinate_criteria['regular_expression'][axis],
+                                    dim.lower()):
+                            return i
+                raise exc
+            except ValueError:
+                # Intercept ValueError when axis type found but not dimension coordinate
+                raise AttributeError(f'Requested {axis} dimension coordinate but {axis} '
+                                     f'coordinate {name} is not a dimension')
+        else:
+            # Otherwise, not valid
+            raise ValueError(_axis_identifier_error)
 
     class _LocIndexer:
         """Provide the unit-wrapped .loc indexer for data arrays."""
@@ -453,6 +477,98 @@ class MetPyDataArrayAccessor:
         indexers = either_dict_or_kwargs(indexers, indexers_kwargs, 'sel')
         indexers = _reassign_quantity_indexer(self._data_array, indexers)
         return self._data_array.sel(indexers, method=method, tolerance=tolerance, drop=drop)
+
+    def assign_crs(self, cf_attributes=None, **kwargs):
+        """Assign a CRS to this DataArray based on CF projection attributes.
+
+        Parameters
+        ----------
+        cf_attributes : dict, optional
+            Dictionary of CF projection attributes
+        kwargs : optional
+            CF projection attributes specified as keyword arguments
+
+        Returns
+        -------
+        `xarray.DataArray`
+            New xarray DataArray with CRS coordinate assigned
+
+        Notes
+        -----
+        CF projection arguments should be supplied as a dictionary or collection of kwargs,
+        but not both.
+
+        """
+        return _assign_crs(self._data_array, cf_attributes, kwargs)
+
+    def assign_latitude_longitude(self, force=False):
+        """Assign latitude and longitude coordinates derived from y and x coordinates.
+
+        Parameters
+        ----------
+        force : bool, optional
+            If force is true, overwrite latitude and longitude coordinates if they exist,
+            otherwise, raise a RuntimeError if such coordinates exist.
+
+        Returns
+        -------
+        `xarray.DataArray`
+            New xarray DataArray with latitude and longtiude auxilary coordinates assigned.
+
+        Notes
+        -----
+        A valid CRS coordinate must be present. Cartopy is used for the coordinate
+        transformations.
+
+        """
+        # Check for existing latitude and longitude coords
+        if (not force and (self._metpy_axis_search('latitude') is not None
+                           or self._metpy_axis_search('longitude'))):
+            raise RuntimeError('Latitude/longitude coordinate(s) are present. If you wish to '
+                               'overwrite these, specify force=True.')
+
+        # Build new latitude and longitude DataArrays
+        latitude, longitude = _build_latitude_longitude(self._data_array)
+
+        # Assign new coordinates, refresh MetPy's parsed axis attribute, and return result
+        new_dataarray = self._data_array.assign_coords(latitude=latitude, longitude=longitude)
+        return new_dataarray.metpy.assign_coordinates(None)
+
+    def assign_y_x(self, force=False, tolerance=None):
+        """Assign y and x dimension coordinates derived from 2D latitude and longitude.
+
+        Parameters
+        ----------
+        force : bool, optional
+            If force is true, overwrite y and x coordinates if they exist, otherwise, raise a
+            RuntimeError if such coordinates exist.
+        tolerance : `pint.Quantity`
+            Maximum range tolerated when collapsing projected y and x coordinates from 2D to
+            1D. Defaults to 1 meter.
+
+        Returns
+        -------
+        `xarray.DataArray`
+            New xarray DataArray with y and x dimension coordinates assigned.
+
+        Notes
+        -----
+        A valid CRS coordinate must be present. Cartopy is used for the coordinate
+        transformations.
+
+        """
+        # Check for existing latitude and longitude coords
+        if (not force and (self._metpy_axis_search('y') is not None
+                           or self._metpy_axis_search('x'))):
+            raise RuntimeError('y/x coordinate(s) are present. If you wish to overwrite '
+                               'these, specify force=True.')
+
+        # Build new y and x DataArrays
+        y, x = _build_y_x(self._data_array, tolerance)
+
+        # Assign new coordinates, refresh MetPy's parsed axis attribute, and return result
+        new_dataarray = self._data_array.assign_coords(**{y.name: y, x.name: x})
+        return new_dataarray.metpy.assign_coordinates(None)
 
 
 @xr.register_dataset_accessor('metpy')
@@ -506,7 +622,15 @@ class MetPyDatasetAccessor:
             return subset
 
         var = self._dataset[varname]
+
+        # Assign coordinates if the coordinates argument is given
+        if coordinates is not None:
+            var.metpy.assign_coordinates(coordinates)
+
+        # Attempt to build the crs coordinate
+        crs = None
         if 'grid_mapping' in var.attrs:
+            # Use given CF grid_mapping
             proj_name = var.attrs['grid_mapping']
             try:
                 proj_var = self._dataset.variables[proj_name]
@@ -515,45 +639,48 @@ class MetPyDatasetAccessor:
                     'Could not find variable corresponding to the value of '
                     'grid_mapping: {}'.format(proj_name))
             else:
-                var.coords['crs'] = CFProjection(proj_var.attrs)
+                crs = CFProjection(proj_var.attrs)
 
-        self._fixup_coords(var)
+        if crs is None and not check_axis(var, 'latitude', 'longitude'):
+            # This isn't a lat or lon coordinate itself, so determine if we need to fall back
+            # to creating a latitude_longitude CRS. We do so if there exists valid coordinates
+            # for latitude and longitude, even if they are not the dimension coordinates of
+            # the variable.
+            def _has_coord(coord_type):
+                return any(check_axis(coord_var, coord_type)
+                           for coord_var in var.coords.values())
+            if _has_coord('latitude') and _has_coord('longitude'):
+                crs = CFProjection({'grid_mapping_name': 'latitude_longitude'})
+                log.warning('Found valid latitude/longitude coordinates, assuming '
+                            'latitude_longitude for projection grid_mapping variable')
 
-        # Trying to guess whether we should be adding a crs to this variable's coordinates
-        # First make sure it's missing CRS but isn't lat/lon itself
-        if not check_axis(var, 'latitude', 'longitude') and 'crs' not in var.coords:
-            # Look for both lat/lon in the coordinates
-            has_lat = has_lon = False
-            for coord_var in var.coords.values():
-                has_lat = has_lat or check_axis(coord_var, 'latitude')
-                has_lon = has_lon or check_axis(coord_var, 'longitude')
+        # Rebuild the coordinates of the dataarray, and return quantified DataArray
+        var = self._rebuild_coords(var, crs)
+        if crs is not None:
+            var = var.assign_coords(coords={'crs': crs})
+        return var.metpy.quantify()
 
-            # If we found them, create a lat/lon projection as the crs coord
-            if has_lat and has_lon:
-                var.coords['crs'] = CFProjection({'grid_mapping_name': 'latitude_longitude'})
-                log.warning('Found latitude/longitude values, assuming latitude_longitude '
-                            'for projection grid_mapping variable')
-
-        # Assign coordinates if the coordinates argument is given
-        if coordinates is not None:
-            var.metpy.assign_coordinates(coordinates)
+    def _rebuild_coords(self, var, crs):
+        """Clean up the units on the coordinate variables."""
+        for coord_name, coord_var in var.coords.items():
+            if (check_axis(coord_var, 'x', 'y')
+                    and not check_axis(coord_var, 'longitude', 'latitude')):
+                try:
+                    var = var.metpy.convert_coordinate_units(coord_name, 'meters')
+                except DimensionalityError:
+                    # Radians! Attempt to use perspective point height conversion
+                    if crs is not None:
+                        height = crs['perspective_point_height']
+                        new_coord_var = coord_var.copy(
+                            data=(
+                                coord_var.metpy.unit_array
+                                * (height * units.meter)
+                            ).m_as('meter')
+                        )
+                        new_coord_var.attrs['units'] = 'meter'
+                        var = var.assign_coords(coords={coord_name: new_coord_var})
 
         return var
-
-    def _fixup_coords(self, var):
-        """Clean up the units on the coordinate variables."""
-        for coord_name, data_array in var.coords.items():
-            if (check_axis(data_array, 'x', 'y')
-                    and not check_axis(data_array, 'longitude', 'latitude')):
-                try:
-                    var.coords[coord_name].metpy.convert_units('meters')
-                except DimensionalityError:  # Radians!
-                    if 'crs' in var.coords:
-                        new_data_array = data_array.copy()
-                        height = var.coords['crs'].item()['perspective_point_height']
-                        scaled_vals = new_data_array.metpy.unit_array * (height * units.meters)
-                        new_data_array.metpy.unit_array = scaled_vals.to('meters')
-                        var.coords[coord_name] = new_data_array
 
     class _LocIndexer:
         """Provide the unit-wrapped .loc indexer for datasets."""
@@ -575,6 +702,151 @@ class MetPyDatasetAccessor:
         indexers = either_dict_or_kwargs(indexers, indexers_kwargs, 'sel')
         indexers = _reassign_quantity_indexer(self._dataset, indexers)
         return self._dataset.sel(indexers, method=method, tolerance=tolerance, drop=drop)
+
+    def assign_crs(self, cf_attributes=None, **kwargs):
+        """Assign a CRS to this Datatset based on CF projection attributes.
+
+        Parameters
+        ----------
+        cf_attributes : dict, optional
+            Dictionary of CF projection attributes
+        kwargs : optional
+            CF projection attributes specified as keyword arguments
+
+        Returns
+        -------
+        `xarray.Dataset`
+            New xarray Dataset with CRS coordinate assigned
+
+        Notes
+        -----
+        CF projection arguments should be supplied as a dictionary or collection of kwargs,
+        but not both.
+
+        """
+        return _assign_crs(self._dataset, cf_attributes, kwargs)
+
+    def assign_latitude_longitude(self, force=False):
+        """Assign latitude and longitude coordinates derived from y and x coordinates.
+
+        Parameters
+        ----------
+        force : bool, optional
+            If force is true, overwrite latitude and longitude coordinates if they exist,
+            otherwise, raise a RuntimeError if such coordinates exist.
+
+        Returns
+        -------
+        `xarray.Dataset`
+            New xarray Dataset with latitude and longitude coordinates assigned to all
+            variables with y and x coordinates.
+
+        Notes
+        -----
+        A valid CRS coordinate must be present. Cartopy is used for the coordinate
+        transformations.
+
+        """
+        # Determine if there is a valid grid prototype from which to compute the coordinates,
+        # while also checking for existing lat/lon coords
+        grid_prototype = None
+        for data_var in self._dataset.data_vars.values():
+            if hasattr(data_var.metpy, 'y') and hasattr(data_var.metpy, 'x'):
+                if grid_prototype is None:
+                    grid_prototype = data_var
+                if (not force and (hasattr(data_var.metpy, 'latitude')
+                                   or hasattr(data_var.metpy, 'longitude'))):
+                    raise RuntimeError('Latitude/longitude coordinate(s) are present. If you '
+                                       'wish to overwrite these, specify force=True.')
+
+        # Calculate latitude and longitude from grid_prototype, if it exists, and assign
+        if grid_prototype is None:
+            warnings.warn('No latitude and longitude assigned since horizontal coordinates '
+                          'were not found')
+            return self._dataset
+        else:
+            latitude, longitude = _build_latitude_longitude(grid_prototype)
+            return self._dataset.assign_coords(latitude=latitude, longitude=longitude)
+
+    def assign_y_x(self, force=False, tolerance=None):
+        """Assign y and x dimension coordinates derived from 2D latitude and longitude.
+
+        Parameters
+        ----------
+        force : bool, optional
+            If force is true, overwrite y and x coordinates if they exist, otherwise, raise a
+            RuntimeError if such coordinates exist.
+        tolerance : `pint.Quantity`
+            Maximum range tolerated when collapsing projected y and x coordinates from 2D to
+            1D. Defaults to 1 meter.
+
+        Returns
+        -------
+        `xarray.Dataset`
+            New xarray Dataset with y and x dimension coordinates assigned to all variables
+            with valid latitude and longitude coordinates.
+
+        Notes
+        -----
+        A valid CRS coordinate must be present. Cartopy is used for the coordinate
+        transformations.
+
+        """
+        # Determine if there is a valid grid prototype from which to compute the coordinates,
+        # while also checking for existing y and x coords
+        grid_prototype = None
+        for data_var in self._dataset.data_vars.values():
+            if hasattr(data_var.metpy, 'latitude') and hasattr(data_var.metpy, 'longitude'):
+                if grid_prototype is None:
+                    grid_prototype = data_var
+                if (not force and (hasattr(data_var.metpy, 'y')
+                                   or hasattr(data_var.metpy, 'x'))):
+                    raise RuntimeError('y/x coordinate(s) are present. If you wish to '
+                                       'overwrite these, specify force=True.')
+
+        # Calculate y and x from grid_prototype, if it exists, and assign
+        if grid_prototype is None:
+            warnings.warn('No y and x coordinates assigned since horizontal coordinates '
+                          'were not found')
+            return self._dataset
+        else:
+            y, x = _build_y_x(grid_prototype, tolerance)
+            return self._dataset.assign_coords(**{y.name: y, x.name: x})
+
+    def update_attribute(self, attribute, mapping):
+        """Update attribute of all Dataset variables.
+
+        Parameters
+        ----------
+        attribute : str,
+            Name of attribute to update
+        mapping : dict or callable
+            Either a dict, with keys as variable names and values as attribute values to set,
+            or a callable, which must accept one positional argument (variable name) and
+            arbitrary keyword arguments (all existing variable attributes). If a variable name
+            is not present/the callable returns None, the attribute will not be updated.
+
+        Returns
+        -------
+        `xarray.Dataset`
+            Dataset with attribute updated (modified in place, and returned to allow method
+            chaining)
+
+        """
+        # Make mapping uniform
+        if callable(mapping):
+            mapping_func = mapping
+        else:
+            def mapping_func(varname, **kwargs):
+                return mapping.get(varname, None)
+
+        # Apply across all variables
+        for varname in list(self._dataset.data_vars) + list(self._dataset.coords):
+            value = mapping_func(varname, **self._dataset[varname].attrs)
+            if value is not None:
+                self._dataset[varname].attrs[attribute] = value
+
+        return self._dataset
 
 
 def _assign_axis(attributes, axis):
@@ -622,12 +894,12 @@ def check_axis(var, *axes):
             if (axis in coordinate_criteria['units'] and (
                     (
                         coordinate_criteria['units'][axis]['match'] == 'dimensionality'
-                        and (units.get_dimensionality(var.attrs.get('units'))
+                        and (units.get_dimensionality(var.metpy.units)
                              == units.get_dimensionality(
                                  coordinate_criteria['units'][axis]['units']))
                     ) or (
                         coordinate_criteria['units'][axis]['match'] == 'name'
-                        and var.attrs.get('units')
+                        and str(var.metpy.units)
                         in coordinate_criteria['units'][axis]['units']
                     ))):
                 return True
@@ -640,6 +912,78 @@ def check_axis(var, *axes):
 
     # If no match has been made, return False (rather than None)
     return False
+
+
+def _assign_crs(xarray_object, cf_attributes, cf_kwargs):
+    from .plots.mapping import CFProjection
+
+    # Handle argument options
+    if cf_attributes is not None and len(cf_kwargs) > 0:
+        raise ValueError('Cannot specify both attribute dictionary and kwargs.')
+    elif cf_attributes is None and len(cf_kwargs) == 0:
+        raise ValueError('Must specify either attribute dictionary or kwargs.')
+    attrs = cf_attributes if cf_attributes is not None else cf_kwargs
+
+    # Assign crs coordinate to xarray object
+    return xarray_object.assign_coords(crs=CFProjection(attrs))
+
+
+def _build_latitude_longitude(da):
+    """Build latitude/longitude coordinates from DataArray's y/x coordinates."""
+    y, x = da.metpy.coordinates('y', 'x')
+    xx, yy = np.meshgrid(x.values, y.values)
+    lonlats = ccrs.Geodetic(globe=da.metpy.cartopy_globe).transform_points(
+        da.metpy.cartopy_crs, xx, yy)
+    longitude = xr.DataArray(lonlats[..., 0], dims=(y.name, x.name),
+                             coords={y.name: y, x.name: x},
+                             attrs={'units': 'degrees_east', 'standard_name': 'longitude'})
+    latitude = xr.DataArray(lonlats[..., 1], dims=(y.name, x.name),
+                            coords={y.name: y, x.name: x},
+                            attrs={'units': 'degrees_north', 'standard_name': 'latitude'})
+    return latitude, longitude
+
+
+def _build_y_x(da, tolerance):
+    """Build y/x coordinates from DataArray's latitude/longitude coordinates."""
+    # Initial sanity checks
+    latitude, longitude = da.metpy.coordinates('latitude', 'longitude')
+    if latitude.dims != longitude.dims:
+        raise ValueError('Latitude and longitude must have same dimensionality')
+    elif latitude.ndim != 2:
+        raise ValueError('To build 1D y/x coordinates via assign_y_x, latitude/longitude '
+                         'must be 2D')
+
+    # Convert to projected y/x
+    xxyy = da.metpy.cartopy_crs.transform_points(ccrs.Geodetic(da.metpy.cartopy_globe),
+                                                 longitude.values,
+                                                 latitude.values)
+
+    # Handle tolerance
+    tolerance = 1 if tolerance is None else tolerance.m_as('m')
+
+    # If within tolerance, take median to collapse to 1D
+    try:
+        y_dim = latitude.metpy.find_axis_number('y')
+        x_dim = latitude.metpy.find_axis_number('x')
+    except AttributeError:
+        warnings.warn('y and x dimensions unable to be identified. Assuming [..., y, x] '
+                      'dimension order.')
+        y_dim, x_dim = 0, 1
+    if (np.all(np.ptp(xxyy[..., 0], axis=y_dim) < tolerance)
+            and np.all(np.ptp(xxyy[..., 1], axis=x_dim) < tolerance)):
+        x = np.median(xxyy[..., 0], axis=y_dim)
+        y = np.median(xxyy[..., 1], axis=x_dim)
+        x = xr.DataArray(x, name=latitude.dims[x_dim], dims=(latitude.dims[x_dim],),
+                         coords={latitude.dims[x_dim]: x},
+                         attrs={'units': 'meter', 'standard_name': 'projection_x_coordinate'})
+        y = xr.DataArray(y, name=latitude.dims[y_dim], dims=(latitude.dims[y_dim],),
+                         coords={latitude.dims[y_dim]: y},
+                         attrs={'units': 'meter', 'standard_name': 'projection_y_coordinate'})
+        return y, x
+    else:
+        raise ValueError('Projected y and x coordinates cannot be collapsed to 1D within '
+                         'tolerance. Verify that your latitude and longitude coordinates '
+                         'correpsond to your CRS coordinate.')
 
 
 def preprocess_xarray(func):
@@ -671,28 +1015,11 @@ def check_matching_coordinates(func):
     return wrapper
 
 
-# If DatetimeAccessor does not have a strftime (xarray <0.12.2), monkey patch one in
-try:
-    from xarray.core.accessors import DatetimeAccessor
-    if not hasattr(DatetimeAccessor, 'strftime'):
-        def strftime(self, date_format):
-            """Format time as a string."""
-            import pandas as pd
-            values = self._obj.data
-            values_as_series = pd.Series(values.ravel())
-            strs = values_as_series.dt.strftime(date_format)
-            return strs.values.reshape(values.shape)
-
-        DatetimeAccessor.strftime = strftime
-except ImportError:
-    pass
-
-
 def _reassign_quantity_indexer(data, indexers):
     """Reassign a units.Quantity indexer to units of relevant coordinate."""
     def _to_magnitude(val, unit):
         try:
-            return val.to(unit).m
+            return val.m_as(unit)
         except AttributeError:
             return val
 

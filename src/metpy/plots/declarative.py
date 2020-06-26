@@ -500,7 +500,7 @@ class Panel(HasTraits):
 
 @exporter.export
 class PanelContainer(HasTraits):
-    """Collects panels and set complete figure related settings (e.g., figsize)."""
+    """Collects panels and set complete figure related settings (e.g., size)."""
 
     size = Union([Tuple(Int(), Int()), Instance(type(None))], default_value=None)
     size.__doc__ = """This trait takes a tuple of (width, height) to set the size of the
@@ -616,7 +616,7 @@ class MapPanel(Panel):
     This trait can also be set with a string value associated with the named geographic regions
     within MetPy. The tuples associated with the names are based on a PlatteCarree projection.
     For a CONUS region, the following strings can be used: 'us', 'spcus', 'ncus', and 'afus'.
-    For regional plots, US state postal codes can be used.
+    For regional plots, US postal state abbreviations can be used.
     """
 
     projection = Union([Unicode(), Instance('cartopy.crs.Projection')], default_value='data')
@@ -630,12 +630,12 @@ class MapPanel(Panel):
 
     layers = List(Union([Unicode(), Instance('cartopy.feature.Feature')]),
                   default_value=['coastline'])
-    layers.__doc__ = """A string for a pre-defined feature layer or a Cartopy Feature object.
+    layers.__doc__ = """A list of strings for a pre-defined feature layer or a Cartopy Feature object.
 
     Like the projection, there are a couple of pre-defined feature layers that can be called
     using a short name. The pre-defined layers are: 'coastline', 'states', 'borders', 'lakes',
-    'land', 'ocean', and 'rivers'. Additionally, this trait can be set using a Cartopy Feature
-    object.
+    'land', 'ocean', 'rivers', 'usstates', and 'uscounties'. Additionally, this can accept
+    Cartopy Feature objects.
     """
 
     title = Unicode()
@@ -730,6 +730,18 @@ class MapPanel(Panel):
         # Only need to run if we've actually changed.
         if self._need_redraw:
 
+            # Set the extent as appropriate based on the area. One special case for 'global'
+            if self.area == 'global':
+                self.ax.set_global()
+            elif self.area is not None:
+                # Try to look up if we have a string
+                if isinstance(self.area, str):
+                    area = _areas[self.area.lower()]
+                # Otherwise, assume we have a tuple to use as the extent
+                else:
+                    area = self.area
+                self.ax.set_extent(area, DEFAULT_LAT_LON)
+
             # Draw all of the plots.
             for p in self.plots:
                 with p.hold_trait_notifications():
@@ -738,18 +750,6 @@ class MapPanel(Panel):
             # Add all of the maps
             for feat in self._layer_features:
                 self.ax.add_feature(feat)
-
-            # Set the extent as appropriate based on the area. One special case for 'global'
-            if self.area == 'global':
-                self.ax.set_global()
-            elif self.area is not None:
-                # Try to look up if we have a string
-                if isinstance(self.area, str):
-                    area = _areas[self.area]
-                # Otherwise, assume we have a tuple to use as the extent
-                else:
-                    area = self.area
-                self.ax.set_extent(area, DEFAULT_LAT_LON)
 
             # Use the set title or generate one.
             title = self.title or ',\n'.join(plot.name for plot in self.plots)
@@ -781,6 +781,13 @@ class Plots2D(HasTraits):
     If a forecast hour is to be plotted the time should be set to the valid future time, which
     can be done using the `~datetime.datetime` and `~datetime.timedelta` objects
     from the Python standard library.
+    """
+
+    plot_units = Unicode(allow_none=True, default_value=None)
+    plot_units.__doc__ = """The desired units to plot the field in.
+
+    Setting this attribute will convert the units of the field variable to the given units for
+    plotting using the MetPy Units module.
     """
 
     @property
@@ -918,7 +925,11 @@ class PlotScalar(Plots2D):
 
             if self.time is not None:
                 subset[data.metpy.time.name] = self.time
-            self._griddata = data.metpy.sel(**subset).squeeze()
+            data_subset = data.metpy.sel(**subset).squeeze()
+
+            if self.plot_units is not None:
+                data_subset = data_subset.metpy.convert_units(self.plot_units)
+            self._griddata = data_subset
 
         return self._griddata
 
@@ -989,10 +1000,11 @@ class ColorfillTraits(HasTraits):
     """
 
     colorbar = Unicode(default_value=None, allow_none=True)
-    colorbar.__doc__ = """A boolean (True/False) on whether to add a colorbar to the plot.
+    colorbar.__doc__ = """A string (horizontal/vertical) on whether to add a colorbar to the plot.
 
-    To add a colorbar associated with the plot data set the trait to ``True``, the default
-    values is ``False``.
+    To add a colorbar associated with the plot, set the trait to ``horizontal`` or
+    ``vertical``,specifying the orientation of the produced colorbar. The default value is
+    ``None``.
     """
 
 
@@ -1088,7 +1100,7 @@ class ContourPlot(PlotScalar, ContourTraits):
                                              linestyles=self.linestyle,
                                              transform=imdata.metpy.cartopy_crs)
         if self.clabels:
-            self.handle.clabel(inline=1, fmt='%.0f', inline_spacing=2,
+            self.handle.clabel(inline=1, fmt='%.0f', inline_spacing=8,
                                use_clabeltext=True)
 
 
@@ -1190,8 +1202,14 @@ class PlotVector(Plots2D):
 
             if self.time is not None:
                 subset[u.metpy.time.name] = self.time
-            self._griddata_u = u.metpy.sel(**subset).squeeze()
-            self._griddata_v = v.metpy.sel(**subset).squeeze()
+            data_subset_u = u.metpy.sel(**subset).squeeze()
+            data_subset_v = v.metpy.sel(**subset).squeeze()
+
+            if self.plot_units is not None:
+                data_subset_u = data_subset_u.metpy.convert_units(self.plot_units)
+                data_subset_v = data_subset_v.metpy.convert_units(self.plot_units)
+            self._griddata_u = data_subset_u
+            self._griddata_v = data_subset_v
 
         return (self._griddata_u, self._griddata_v)
 
@@ -1284,6 +1302,7 @@ class PlotObs(HasTraits):
       * colors (optional)
       * vector_field (optional)
       * vector_field_color (optional)
+      * vector_field_length (optional)
       * reduce_points (optional)
     """
 
@@ -1355,6 +1374,11 @@ class PlotObs(HasTraits):
 
     vector_field_color = Unicode('black', allow_none=True)
     vector_field_color.__doc__ = """String color name to plot the vector. (optional)"""
+
+    vector_field_length = Int(default_value=None, allow_none=True)
+    vector_field_length.__doc__ = """Integer value to set the length of the plotted vector.
+    (optional)
+    """
 
     reduce_points = Float(default_value=0)
     reduce_points.__doc__ = """Float to reduce number of points plotted. (optional)"""
@@ -1493,8 +1517,12 @@ class PlotObs(HasTraits):
                 color = self.colors[i]
             else:
                 color = self.colors[0]
-            if self.formats[i] is not None:
-                mapper = getattr(wx_symbols, str(self.formats[i]), None)
+            if len(self.formats) > 1:
+                formats = self.formats[i]
+            else:
+                formats = self.formats[0]
+            if formats is not None:
+                mapper = getattr(wx_symbols, str(formats), None)
                 if mapper is not None:
                     self.handle.plot_symbol(location, data[ob_type][subset],
                                             mapper, color=color)
@@ -1504,5 +1532,8 @@ class PlotObs(HasTraits):
             else:
                 self.handle.plot_parameter(location, data[ob_type][subset], color=color)
         if self.vector_field[0] is not None:
+            kwargs = {'color': self.vector_field_color}
+            if self.vector_field_length is not None:
+                kwargs['length'] = self.vector_field_length
             self.handle.plot_barb(data[self.vector_field[0]][subset],
-                                  data[self.vector_field[1]][subset])
+                                  data[self.vector_field[1]][subset], **kwargs)

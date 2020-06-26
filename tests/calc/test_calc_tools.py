@@ -5,6 +5,7 @@
 
 from collections import namedtuple
 
+import cartopy.crs as ccrs
 import numpy as np
 import numpy.ma as ma
 import pandas as pd
@@ -18,9 +19,10 @@ from metpy.calc import (angle_to_direction, find_bounding_indices, find_intersec
                         reduce_point_density, resample_nn_1d, second_derivative)
 from metpy.calc.tools import (_delete_masked_points, _get_bound_pressure_height,
                               _greater_or_close, _less_or_close, _next_non_masked_element,
-                              _remove_nans, BASE_DEGREE_MULTIPLIER, DIR_STRS, UND)
+                              _remove_nans, BASE_DEGREE_MULTIPLIER, DIR_STRS, UND,
+                              wrap_output_like)
 from metpy.testing import (assert_almost_equal, assert_array_almost_equal, assert_array_equal)
-from metpy.units import units
+from metpy.units import DimensionalityError, units
 
 
 FULL_CIRCLE_DEGREES = np.arange(0, 360, BASE_DEGREE_MULTIPLIER.m) * units.degree
@@ -242,7 +244,7 @@ def get_bounds_data():
 ])
 def test_get_bound_pressure_height(pressure, bound, hgts, interp, expected):
     """Test getting bounds in layers with various parameter combinations."""
-    bounds = _get_bound_pressure_height(pressure, bound, heights=hgts, interpolate=interp)
+    bounds = _get_bound_pressure_height(pressure, bound, height=hgts, interpolate=interp)
     assert_array_almost_equal(bounds[0], expected[0], 4)
     assert_array_almost_equal(bounds[1], expected[1], 4)
 
@@ -268,9 +270,9 @@ def test_get_bound_height_out_of_range():
     p = np.arange(900, 300, -100) * units.hPa
     h = np.arange(1, 7) * units.kilometer
     with pytest.raises(ValueError):
-        _get_bound_pressure_height(p, 8 * units.kilometer, heights=h)
+        _get_bound_pressure_height(p, 8 * units.kilometer, height=h)
     with pytest.raises(ValueError):
-        _get_bound_pressure_height(p, 100 * units.meter, heights=h)
+        _get_bound_pressure_height(p, 100 * units.meter, height=h)
 
 
 @pytest.mark.parametrize('flip_order', [(True, False)])
@@ -289,7 +291,7 @@ def test_get_layer_float32(flip_order):
     if flip_order:
         p = p[::-1]
         hgt = hgt[::-1]
-    p_layer, hgt_layer = get_layer(p, hgt, heights=hgt, depth=1000. * units.meter)
+    p_layer, hgt_layer = get_layer(p, hgt, height=hgt, depth=1000. * units.meter)
     assert_array_almost_equal(p_layer, true_p_layer, 4)
     assert_array_almost_equal(hgt_layer, true_hgt_layer, 4)
 
@@ -329,7 +331,7 @@ def layer_test_data():
 ])
 def test_get_layer(pressure, variable, heights, bottom, depth, interp, expected):
     """Test get_layer functionality."""
-    p_layer, y_layer = get_layer(pressure, variable, heights=heights, bottom=bottom,
+    p_layer, y_layer = get_layer(pressure, variable, height=heights, bottom=bottom,
                                  depth=depth, interpolate=interp)
     assert_array_almost_equal(p_layer, expected[0], 4)
     assert_array_almost_equal(y_layer, expected[1], 4)
@@ -554,6 +556,20 @@ def test_first_derivative_masked():
 
     truth = np.ma.array([1., 1., 1., 1., 1., 1., 1.],
                         mask=[False, False, True, True, True, False, False])
+    assert_array_almost_equal(df_dx, truth)
+    assert_array_equal(df_dx.mask, truth.mask)
+
+
+def test_first_derivative_masked_units():
+    """Test that first_derivative properly propagates masks with units."""
+    data = units('K') * np.ma.arange(7)
+    data[3] = np.ma.masked
+    x = units('m') * np.ma.arange(7)
+    df_dx = first_derivative(data, x=x)
+
+    truth = units('K / m') * np.ma.array(
+        [1., 1., 1., 1., 1., 1., 1.],
+        mask=[False, False, True, True, True, False, False])
     assert_array_almost_equal(df_dx, truth)
     assert_array_equal(df_dx.mask, truth.mask)
 
@@ -988,6 +1004,75 @@ def test_grid_deltas_from_dataarray_xy(test_da_xy):
     assert_array_almost_equal(dy, true_dy, 5)
 
 
+def test_grid_deltas_from_dataarray_actual_xy(test_da_xy):
+    """Test grid_deltas_from_dataarray with a xy grid and kind='actual'."""
+    # Construct lon/lat coordinates
+    y, x = xr.broadcast(*test_da_xy.metpy.coordinates('y', 'x'))
+    lonlat = (ccrs.Geodetic(test_da_xy.metpy.cartopy_globe)
+              .transform_points(test_da_xy.metpy.cartopy_crs, x.values, y.values))
+    lon = lonlat[..., 0]
+    lat = lonlat[..., 1]
+    test_da_xy = test_da_xy.assign_coords(
+        longitude=xr.DataArray(lon, dims=('y', 'x'), attrs={'units': 'degrees_east'}),
+        latitude=xr.DataArray(lat, dims=('y', 'x'), attrs={'units': 'degrees_north'}))
+
+    # Actually test calculation
+    dx, dy = grid_deltas_from_dataarray(test_da_xy, kind='actual')
+    true_dx = [[[[494426.3249766, 493977.6028005, 493044.0656467],
+                 [498740.2046073, 498474.9771064, 497891.6588559],
+                 [500276.2649627, 500256.3440237, 500139.9484845],
+                 [498740.6956936, 499045.0391707, 499542.7244501]]]] * units.m
+    true_dy = [[[[496862.4106337, 496685.4729999, 496132.0732114, 495137.8882404],
+                 [499774.9676486, 499706.3354977, 499467.5546773, 498965.2587818],
+                 [499750.8962991, 499826.2263137, 500004.4977747, 500150.9897759]]]] * units.m
+    assert_array_almost_equal(dx, true_dx, 3)
+    assert_array_almost_equal(dy, true_dy, 3)
+
+
+def test_grid_deltas_from_dataarray_nominal_lonlat(test_da_lonlat):
+    """Test grid_deltas_from_dataarray with a lonlat grid and kind='nominal'."""
+    dx, dy = grid_deltas_from_dataarray(test_da_lonlat, kind='nominal')
+    true_dx = [[[3.333333] * 3]] * units.degrees
+    true_dy = [[[3.333333]] * 3] * units.degrees
+    assert_array_almost_equal(dx, true_dx, 5)
+    assert_array_almost_equal(dy, true_dy, 5)
+
+
+def test_grid_deltas_from_dataarray_lonlat_assumed_order():
+    """Test grid_deltas_from_dataarray when dim order must be assumed."""
+    # Create test dataarray
+    lat, lon = np.meshgrid(np.array([38., 40., 42]), np.array([263., 265., 267.]))
+    test_da = xr.DataArray(
+        np.linspace(300, 250, 3 * 3).reshape((3, 3)),
+        name='temperature',
+        dims=('dim_0', 'dim_1'),
+        coords={
+            'lat': xr.DataArray(lat, dims=('dim_0', 'dim_1'),
+                                attrs={'units': 'degrees_north'}),
+            'lon': xr.DataArray(lon, dims=('dim_0', 'dim_1'), attrs={'units': 'degrees_east'})
+        },
+        attrs={'units': 'K'}).to_dataset().metpy.parse_cf('temperature')
+
+    # Run and check for warning
+    with pytest.warns(UserWarning, match=r'y and x dimensions unable to be identified.*'):
+        dx, dy = grid_deltas_from_dataarray(test_da)
+
+    # Check results
+    true_dx = [[222031.0111961, 222107.8492205],
+               [222031.0111961, 222107.8492205],
+               [222031.0111961, 222107.8492205]] * units.m
+    true_dy = [[175661.5413976, 170784.1311091, 165697.7563223],
+               [175661.5413976, 170784.1311091, 165697.7563223]] * units.m
+    assert_array_almost_equal(dx, true_dx, 5)
+    assert_array_almost_equal(dy, true_dy, 5)
+
+
+def test_grid_deltas_from_dataarray_invalid_kind(test_da_xy):
+    """Test grid_deltas_from_dataarray when kind is invalid."""
+    with pytest.raises(ValueError):
+        grid_deltas_from_dataarray(test_da_xy, kind='invalid')
+
+
 def test_first_derivative_xarray_lonlat(test_da_lonlat):
     """Test first derivative with an xarray.DataArray on a lonlat grid in each axis usage."""
     deriv = first_derivative(test_da_lonlat, axis='lon')  # dimension coordinate name
@@ -1002,6 +1087,7 @@ def test_first_derivative_xarray_lonlat(test_da_lonlat):
     _, truth = xr.broadcast(test_da_lonlat, partial)
     truth.coords['crs'] = test_da_lonlat['crs']
     truth.attrs['units'] = 'kelvin / meter'
+    truth.metpy.quantify()
 
     # Assert result matches expectation
     xr.testing.assert_allclose(deriv, truth)
@@ -1017,6 +1103,7 @@ def test_first_derivative_xarray_time_and_default_axis(test_da_xy):
     deriv = first_derivative(test_da_xy)
     truth = xr.full_like(test_da_xy, -0.000777000777)
     truth.attrs['units'] = 'kelvin / second'
+    truth.metpy.quantify()
 
     xr.testing.assert_allclose(deriv, truth)
     assert deriv.metpy.units == truth.metpy.units
@@ -1036,6 +1123,7 @@ def test_first_derivative_xarray_time_subsecond_precision():
 
     truth = xr.full_like(test_da, 5.)
     truth.attrs['units'] = 'kelvin / second'
+    truth.metpy.quantify()
 
     xr.testing.assert_allclose(deriv, truth)
     assert deriv.metpy.units == truth.metpy.units
@@ -1053,6 +1141,7 @@ def test_second_derivative_xarray_lonlat(test_da_lonlat):
     _, truth = xr.broadcast(test_da_lonlat, partial)
     truth.coords['crs'] = test_da_lonlat['crs']
     truth.attrs['units'] = 'kelvin / meter^2'
+    truth.metpy.quantify()
 
     xr.testing.assert_allclose(deriv, truth)
     assert deriv.metpy.units == truth.metpy.units
@@ -1067,9 +1156,11 @@ def test_gradient_xarray(test_da_xy):
 
     truth_x = xr.full_like(test_da_xy, -6.993007e-07)
     truth_x.attrs['units'] = 'kelvin / meter'
+    truth_x.metpy.quantify()
 
     truth_y = xr.full_like(test_da_xy, -2.797203e-06)
     truth_y.attrs['units'] = 'kelvin / meter'
+    truth_y.metpy.quantify()
 
     partial = xr.DataArray(
         np.array([0.04129204, 0.03330003, 0.02264402]),
@@ -1078,6 +1169,7 @@ def test_gradient_xarray(test_da_xy):
     _, truth_p = xr.broadcast(test_da_xy, partial)
     truth_p.coords['crs'] = test_da_xy['crs']
     truth_p.attrs['units'] = 'kelvin / hectopascal'
+    truth_p.metpy.quantify()
 
     # Assert results match expectations
     xr.testing.assert_allclose(deriv_x, truth_x)
@@ -1103,9 +1195,44 @@ def test_gradient_xarray_implicit_axes(test_da_xy):
 
     truth_x = xr.full_like(data, -6.993007e-07)
     truth_x.attrs['units'] = 'kelvin / meter'
+    truth_x.metpy.quantify()
 
     truth_y = xr.full_like(data, -2.797203e-06)
     truth_y.attrs['units'] = 'kelvin / meter'
+    truth_y.metpy.quantify()
+
+    xr.testing.assert_allclose(deriv_x, truth_x)
+    assert deriv_x.metpy.units == truth_x.metpy.units
+
+    xr.testing.assert_allclose(deriv_y, truth_y)
+    assert deriv_y.metpy.units == truth_y.metpy.units
+
+
+def test_gradient_xarray_implicit_axes_transposed(test_da_lonlat):
+    """Test the 2D gradient with no axes specified but in x/y order."""
+    test_da = test_da_lonlat.isel(isobaric=0).transpose('lon', 'lat')
+    deriv_x, deriv_y = gradient(test_da)
+
+    truth_x = xr.DataArray(
+        np.array(
+            [[-3.30782978e-06, -3.42816074e-06, -3.57012948e-06, -3.73759364e-06],
+             [-3.30782978e-06, -3.42816074e-06, -3.57012948e-06, -3.73759364e-06],
+             [-3.30782978e-06, -3.42816074e-06, -3.57012948e-06, -3.73759364e-06],
+             [-3.30782978e-06, -3.42816074e-06, -3.57012948e-06, -3.73759364e-06]]
+        ) * units('kelvin / meter'),
+        dims=test_da.dims,
+        coords=test_da.coords
+    )
+    truth_y = xr.DataArray(
+        np.array(
+            [[-1.15162805e-05, -1.15101023e-05, -1.15037894e-05, -1.14973413e-05],
+             [-1.15162805e-05, -1.15101023e-05, -1.15037894e-05, -1.14973413e-05],
+             [-1.15162805e-05, -1.15101023e-05, -1.15037894e-05, -1.14973413e-05],
+             [-1.15162805e-05, -1.15101023e-05, -1.15037894e-05, -1.14973413e-05]]
+        ) * units('kelvin / meter'),
+        dims=test_da.dims,
+        coords=test_da.coords
+    )
 
     xr.testing.assert_allclose(deriv_x, truth_x)
     assert deriv_x.metpy.units == truth_x.metpy.units
@@ -1126,6 +1253,7 @@ def test_laplacian_xarray_lonlat(test_da_lonlat):
     _, truth = xr.broadcast(test_da_lonlat, partial)
     truth.coords['crs'] = test_da_lonlat['crs']
     truth.attrs['units'] = 'kelvin / meter^2'
+    truth.metpy.quantify()
 
     xr.testing.assert_allclose(laplac, truth)
     assert laplac.metpy.units == truth.metpy.units
@@ -1161,3 +1289,213 @@ def test_remove_nans():
     y_expected = np.array([0, 1, 3, 4])
     assert_array_almost_equal(x_expected, x_test, 0)
     assert_almost_equal(y_expected, y_test, 0)
+
+
+@pytest.mark.parametrize('test, other, match_unit, expected', [
+    (np.arange(4), np.arange(4), False, np.arange(4) * units('dimensionless')),
+    (np.arange(4), np.arange(4), True, np.arange(4) * units('dimensionless')),
+    (np.arange(4), [0] * units.m, False, np.arange(4) * units('dimensionless')),
+    (np.arange(4), [0] * units.m, True, np.arange(4) * units.m),
+    (
+        np.arange(4),
+        xr.DataArray(
+            np.zeros(4) * units.meter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 4)},
+            attrs={'description': 'Just some zeros'}
+        ),
+        False,
+        xr.DataArray(
+            np.arange(4) * units.dimensionless,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 4)}
+        )
+    ),
+    (
+        np.arange(4),
+        xr.DataArray(
+            np.zeros(4) * units.meter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 4)},
+            attrs={'description': 'Just some zeros'}
+        ),
+        True,
+        xr.DataArray(
+            np.arange(4) * units.meter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 4)}
+        )
+    ),
+    ([2, 4, 8] * units.kg, [0] * units.m, False, [2, 4, 8] * units.kg),
+    ([2, 4, 8] * units.kg, [0] * units.g, True, [2000, 4000, 8000] * units.g),
+    (
+        [2, 4, 8] * units.kg,
+        xr.DataArray(
+            np.zeros(3) * units.meter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        ),
+        False,
+        xr.DataArray(
+            [2, 4, 8] * units.kilogram,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        )
+    ),
+    (
+        [2, 4, 8] * units.kg,
+        xr.DataArray(
+            np.zeros(3) * units.gram,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        ),
+        True,
+        xr.DataArray(
+            [2000, 4000, 8000] * units.gram,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        )
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        np.arange(4, dtype=np.float64),
+        False,
+        units.Quantity(np.linspace(0, 1, 5), 'meter')
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        [0] * units.kg,
+        False,
+        np.linspace(0, 1, 5) * units.m
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        [0] * units.cm,
+        True,
+        np.linspace(0, 100, 5) * units.cm
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        xr.DataArray(
+            np.zeros(3) * units.kilogram,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)},
+            attrs={'description': 'Alternative data'}
+        ),
+        False,
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        )
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        xr.DataArray(
+            np.zeros(3) * units.centimeter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)},
+            attrs={'description': 'Alternative data'}
+        ),
+        True,
+        xr.DataArray(
+            np.linspace(0, 100, 5) * units.centimeter,
+            attrs={'description': 'A range of values'}
+        )
+    ),
+])
+def test_wrap_output_like_with_other_kwarg(test, other, match_unit, expected):
+    """Test the wrap output like decorator when using the output kwarg."""
+    @wrap_output_like(other=other, match_unit=match_unit)
+    def almost_identity(arg):
+        return arg
+
+    result = almost_identity(test)
+
+    if hasattr(expected, 'units'):
+        assert expected.units == result.units
+    if isinstance(expected, xr.DataArray):
+        xr.testing.assert_identical(result, expected)
+    else:
+        assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize('test, other', [
+    ([2, 4, 8] * units.kg, [0] * units.m),
+    (
+        [2, 4, 8] * units.kg,
+        xr.DataArray(
+            np.zeros(3) * units.meter,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        )
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter
+        ),
+        [0] * units.kg
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter
+        ),
+        xr.DataArray(
+            np.zeros(3) * units.kg,
+            dims=('x',),
+            coords={'x': np.linspace(0, 1, 3)}
+        )
+    ),
+    (
+        xr.DataArray(
+            np.linspace(0, 1, 5) * units.meter,
+            attrs={'description': 'A range of values'}
+        ),
+        np.arange(4, dtype=np.float64)
+    )
+])
+def test_wrap_output_like_with_other_kwarg_raising_dimensionality_error(test, other):
+    """Test the wrap output like decorator when when a dimensionality error is raised."""
+    @wrap_output_like(other=other, match_unit=True)
+    def almost_identity(arg):
+        return arg
+
+    with pytest.raises(DimensionalityError):
+        almost_identity(test)
+
+
+def test_wrap_output_like_with_argument_kwarg():
+    """Test the wrap output like decorator with signature recognition."""
+    @wrap_output_like(argument='a')
+    def double(a):
+        return units.Quantity(2) * a.metpy.unit_array
+
+    test = xr.DataArray([1, 3, 5, 7] * units.m)
+    expected = xr.DataArray([2, 6, 10, 14] * units.m)
+
+    xr.testing.assert_identical(double(test), expected)
+
+
+def test_wrap_output_like_without_control_kwarg():
+    """Test that the wrap output like decorator fails when not provided a control param."""
+    @wrap_output_like()
+    def func(arg):
+        """Do nothing."""
+
+    with pytest.raises(ValueError) as exc:
+        func(0)
+    assert 'Must specify keyword' in str(exc)

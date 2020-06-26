@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 r"""Tests the operation of MetPy's unit support code."""
 
+from distutils.version import LooseVersion
 import sys
 
 import matplotlib.pyplot as plt
@@ -13,8 +14,7 @@ import pytest
 
 from metpy.testing import assert_array_almost_equal, assert_array_equal
 from metpy.testing import assert_nan, set_agg_backend  # noqa: F401
-from metpy.units import (atleast_1d, atleast_2d, check_units, concatenate, diff,
-                         pandas_dataframe_to_unit_arrays, units)
+from metpy.units import check_units, concatenate, pandas_dataframe_to_unit_arrays, units
 
 
 def test_concatenate():
@@ -58,29 +58,6 @@ def test_axvline():
     ax.set_xlim(-1, 1)
     ax.set_xlabel('')
     return fig
-
-
-def test_atleast1d_without_units():
-    """Test that atleast_1d wrapper can handle plain arrays."""
-    assert_array_equal(atleast_1d(1), np.array([1]))
-    assert_array_equal(atleast_1d([1, ], [2, ]), np.array([[1, ], [2, ]]))
-
-
-def test_atleast2d_without_units():
-    """Test that atleast_2d wrapper can handle plain arrays."""
-    assert_array_equal(atleast_2d(1), np.array([[1]]))
-
-
-def test_atleast2d_with_units():
-    """Test that atleast_2d wrapper can handle plain array with units."""
-    assert_array_equal(
-        atleast_2d(1 * units.degC), np.array([[1]]) * units.degC)
-
-
-def test_units_diff():
-    """Test our diff handles units properly."""
-    assert_array_equal(diff(np.arange(20, 22) * units.degC),
-                       np.array([1]) * units.delta_degC)
 
 
 #
@@ -217,3 +194,17 @@ def test_assert_nan_checks_units():
     """Test that assert_nan properly checks units."""
     with pytest.raises(AssertionError):
         assert_nan(np.nan * units.m, units.second)
+
+
+@pytest.mark.skipif(LooseVersion(pint.__version__) < LooseVersion('0.10'),
+                    reason='Custom preprocessors only available in Pint 0.10')
+def test_percent_units():
+    """Test that percent sign units are properly parsed and interpreted."""
+    assert str(units('%').units) == 'percent'
+
+
+@pytest.mark.skipif(LooseVersion(pint.__version__) < LooseVersion('0.10'),
+                    reason='Custom preprocessors only available in Pint 0.10')
+def test_udunits_power_syntax():
+    """Test that UDUNITS style powers are properly parsed and interpreted."""
+    assert units('m2 s-2').units == units.m ** 2 / units.s ** 2

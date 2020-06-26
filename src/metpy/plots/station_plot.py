@@ -10,7 +10,6 @@ import numpy as np
 from .wx_symbols import (current_weather, high_clouds, low_clouds, mid_clouds,
                          pressure_tendency, sky_cover, wx_symbol_font)
 from ..package_tools import Exporter
-from ..units import atleast_1d
 
 exporter = Exporter(globals())
 
@@ -24,7 +23,10 @@ class StationPlot(object):
     """
 
     location_names = {'C': (0, 0), 'N': (0, 1), 'NE': (1, 1), 'E': (1, 0), 'SE': (1, -1),
-                      'S': (0, -1), 'SW': (-1, -1), 'W': (-1, 0), 'NW': (-1, 1)}
+                      'S': (0, -1), 'SW': (-1, -1), 'W': (-1, 0), 'NW': (-1, 1),
+                      'N2': (0, 2), 'NNE': (1, 2), 'ENE': (2, 1), 'E2': (2, 0),
+                      'ESE': (2, -1), 'SSE': (1, -2), 'S2': (0, -2), 'SSW': (-1, -2),
+                      'WSW': (-2, -1), 'W2': (-2, 0), 'WNW': (-2, 1), 'NNW': (-1, 2)}
 
     def __init__(self, ax, x, y, fontsize=10, spacing=None, transform=None, **kwargs):
         """Initialize the StationPlot with items that do not change.
@@ -55,8 +57,8 @@ class StationPlot(object):
 
         """
         self.ax = ax
-        self.x = atleast_1d(x)
-        self.y = atleast_1d(y)
+        self.x = np.atleast_1d(x)
+        self.y = np.atleast_1d(y)
         self.fontsize = fontsize
         self.spacing = fontsize if spacing is None else spacing
         self.transform = transform
@@ -192,6 +194,8 @@ class StationPlot(object):
         plot_barb, plot_symbol, plot_text
 
         """
+        if hasattr(parameter, 'units'):
+            parameter = parameter.magnitude
         text = self._to_string_list(parameter, formatter)
         return self.plot_text(location, text, **kwargs)
 
@@ -353,8 +357,6 @@ class StationPlot(object):
         if not callable(fmt):
             def formatter(s):
                 """Turn a format string into a callable."""
-                if hasattr(s, 'units'):
-                    s = s.item()
                 return format(s, fmt)
         else:
             formatter = fmt

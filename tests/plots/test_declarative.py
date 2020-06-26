@@ -106,6 +106,36 @@ def test_declarative_contour_options():
     return pc.figure
 
 
+@pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.035)
+def test_declarative_contour_convert_units():
+    """Test making a contour plot."""
+    data = xr.open_dataset(get_test_data('narr_example.nc', as_file_obj=False))
+
+    contour = ContourPlot()
+    contour.data = data
+    contour.field = 'Temperature'
+    contour.level = 700 * units.hPa
+    contour.contours = 30
+    contour.linewidth = 1
+    contour.linecolor = 'red'
+    contour.linestyle = 'dashed'
+    contour.clabels = True
+    contour.plot_units = 'degC'
+
+    panel = MapPanel()
+    panel.area = 'us'
+    panel.proj = 'lcc'
+    panel.layers = ['coastline', 'borders', 'usstates']
+    panel.plots = [contour]
+
+    pc = PanelContainer()
+    pc.size = (8, 8)
+    pc.panels = [panel]
+    pc.draw()
+
+    return pc.figure
+
+
 @pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.016)
 def test_declarative_events():
     """Test that resetting traitlets properly propagates."""
@@ -417,6 +447,33 @@ def test_declarative_barb_gfs():
     return pc.figure
 
 
+@pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.346)
+def test_declarative_barb_gfs_knots():
+    """Test making a contour plot."""
+    data = xr.open_dataset(get_test_data('GFS_test.nc', as_file_obj=False))
+
+    barb = BarbPlot()
+    barb.data = data
+    barb.level = 300 * units.hPa
+    barb.field = ['u-component_of_wind_isobaric', 'v-component_of_wind_isobaric']
+    barb.skip = (3, 3)
+    barb.earth_relative = False
+    barb.plot_units = 'knot'
+
+    panel = MapPanel()
+    panel.area = 'us'
+    panel.projection = 'data'
+    panel.layers = ['coastline', 'borders', 'usstates']
+    panel.plots = [barb]
+
+    pc = PanelContainer()
+    pc.size = (8, 8)
+    pc.panels = [panel]
+    pc.draw()
+
+    return pc.figure
+
+
 @pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.022)
 def test_declarative_sfc_obs():
     """Test making a surface observation plot."""
@@ -451,7 +508,7 @@ def test_declarative_sfc_obs():
 
 @pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.022)
 def test_declarative_sfc_obs_changes():
-    """Test making a surface observation plot."""
+    """Test making a surface observation plot, changing the field."""
     data = pd.read_csv(get_test_data('SFC_obs.csv', as_file_obj=False),
                        infer_datetime_format=True, parse_dates=['valid'])
 
@@ -485,7 +542,40 @@ def test_declarative_sfc_obs_changes():
     return pc.figure
 
 
-@pytest.mark.mpl_image_compare(remove_text=True, tolerance=0.022)
+@pytest.mark.mpl_image_compare(remove_text=True, tolerance=0)
+def test_declarative_colored_barbs():
+    """Test making a surface plot with a colored barb (gh-1274)."""
+    data = pd.read_csv(get_test_data('SFC_obs.csv', as_file_obj=False),
+                       infer_datetime_format=True, parse_dates=['valid'])
+
+    obs = PlotObs()
+    obs.data = data
+    obs.time = datetime(1993, 3, 12, 13)
+    obs.level = None
+    obs.vector_field = ('uwind', 'vwind')
+    obs.vector_field_color = 'red'
+    obs.reduce_points = .5
+
+    # Panel for plot with Map features
+    panel = MapPanel()
+    panel.layout = (1, 1, 1)
+    panel.projection = ccrs.PlateCarree()
+    panel.area = 'NE'
+    panel.layers = ['states']
+    panel.plots = [obs]
+
+    # Bringing it all together
+    pc = PanelContainer()
+    pc.size = (10, 10)
+    pc.panels = [panel]
+
+    pc.draw()
+
+    return pc.figure
+
+
+@pytest.mark.mpl_image_compare(remove_text=True,
+                               tolerance={'3.1': 9.771, '2.1': 9.771}.get(MPL_VERSION, 0.))
 def test_declarative_sfc_obs_full():
     """Test making a full surface observation plot."""
     data = pd.read_csv(get_test_data('SFC_obs.csv', as_file_obj=False),
@@ -536,6 +626,7 @@ def test_declarative_upa_obs():
     obs.locations = ['NW', 'SW', 'NE']
     obs.formats = [None, None, lambda v: format(v, '.0f')[:3]]
     obs.vector_field = ('u_wind', 'v_wind')
+    obs.vector_field_length = 7
     obs.reduce_points = 0
 
     # Panel for plot with Map features

@@ -10,9 +10,9 @@ import xarray as xr
 from metpy.calc import (brunt_vaisala_frequency, brunt_vaisala_frequency_squared,
                         brunt_vaisala_period, cape_cin, density, dewpoint,
                         dewpoint_from_relative_humidity, dewpoint_from_specific_humidity,
-                        dewpoint_rh, dry_lapse, dry_static_energy, el,
-                        equivalent_potential_temperature,
-                        exner_function, isentropic_interpolation, lcl, lfc, mixed_layer,
+                        dry_lapse, dry_static_energy, el, equivalent_potential_temperature,
+                        exner_function, gradient_richardson_number,
+                        isentropic_interpolation, lcl, lfc, lifted_index, mixed_layer,
                         mixed_layer_cape_cin, mixed_parcel, mixing_ratio,
                         mixing_ratio_from_relative_humidity,
                         mixing_ratio_from_specific_humidity, moist_lapse,
@@ -35,8 +35,7 @@ from metpy.calc import (brunt_vaisala_frequency, brunt_vaisala_frequency_squared
                         virtual_potential_temperature, virtual_temperature,
                         wet_bulb_temperature)
 from metpy.calc.thermo import _find_append_zero_crossings
-from metpy.testing import (assert_almost_equal, assert_array_almost_equal, assert_nan,
-                           check_and_silence_deprecation)
+from metpy.testing import assert_almost_equal, assert_array_almost_equal, assert_nan
 from metpy.units import units
 
 
@@ -53,9 +52,9 @@ def test_relative_humidity_from_dewpoint_with_f():
 
 
 def test_relative_humidity_from_dewpoint_xarray():
-    """Test Relative Humidity calculation with xarray data arrays."""
+    """Test Relative Humidity with xarray data arrays (quantified and unquantified)."""
     temp = xr.DataArray(25., attrs={'units': 'degC'})
-    dewp = xr.DataArray(15., attrs={'units': 'degC'})
+    dewp = xr.DataArray([15.] * units.degC)
     assert_almost_equal(relative_humidity_from_dewpoint(temp, dewp), 53.80 * units.percent, 2)
 
 
@@ -197,16 +196,6 @@ def test_sat_vapor_pressure_fahrenheit():
     temp = np.array([50., 68.]) * units.degF
     real_es = np.array([12.2717, 23.3695]) * units.mbar
     assert_array_almost_equal(saturation_vapor_pressure(temp), real_es, 4)
-
-
-@check_and_silence_deprecation
-def test_deprecated_dewpoint_rh():
-    """Test deprecated dewpoint_rh function."""
-    temp = np.array([30., 25., 10., 20., 25.]) * units.degC
-    rh = np.array([30., 45., 55., 80., 85.]) / 100.
-
-    real_td = np.array([11, 12, 1, 16, 22]) * units.degC
-    assert_array_almost_equal(real_td, dewpoint_rh(temp, rh), 0)
 
 
 def test_basic_dewpoint_from_relative_humidity():
@@ -680,8 +669,8 @@ def test_wet_psychrometric_vapor_pressure():
     p = 1013.25 * units.mbar
     dry_bulb_temperature = 20. * units.degC
     wet_bulb_temperature = 18. * units.degC
-    psychrometric_vapor_pressure = psychrometric_vapor_pressure_wet(dry_bulb_temperature,
-                                                                    wet_bulb_temperature, p)
+    psychrometric_vapor_pressure = psychrometric_vapor_pressure_wet(p, dry_bulb_temperature,
+                                                                    wet_bulb_temperature)
     assert_almost_equal(psychrometric_vapor_pressure, 19.3673 * units.mbar, 3)
 
 
@@ -690,8 +679,8 @@ def test_wet_psychrometric_rh():
     p = 1013.25 * units.mbar
     dry_bulb_temperature = 20. * units.degC
     wet_bulb_temperature = 18. * units.degC
-    psychrometric_rh = relative_humidity_wet_psychrometric(dry_bulb_temperature,
-                                                           wet_bulb_temperature, p)
+    psychrometric_rh = relative_humidity_wet_psychrometric(p, dry_bulb_temperature,
+                                                           wet_bulb_temperature)
     assert_almost_equal(psychrometric_rh, 82.8747 * units.percent, 3)
 
 
@@ -701,8 +690,8 @@ def test_wet_psychrometric_rh_kwargs():
     dry_bulb_temperature = 20. * units.degC
     wet_bulb_temperature = 18. * units.degC
     coeff = 6.1e-4 / units.kelvin
-    psychrometric_rh = relative_humidity_wet_psychrometric(dry_bulb_temperature,
-                                                           wet_bulb_temperature, p,
+    psychrometric_rh = relative_humidity_wet_psychrometric(p, dry_bulb_temperature,
+                                                           wet_bulb_temperature,
                                                            psychrometer_coefficient=coeff)
     assert_almost_equal(psychrometric_rh, 82.9701 * units.percent, 3)
 
@@ -712,7 +701,7 @@ def test_mixing_ratio_from_relative_humidity():
     p = 1013.25 * units.mbar
     temperature = 20. * units.degC
     rh = 81.7219 * units.percent
-    w = mixing_ratio_from_relative_humidity(rh, temperature, p)
+    w = mixing_ratio_from_relative_humidity(p, temperature, rh)
     assert_almost_equal(w, 0.012 * units.dimensionless, 3)
 
 
@@ -721,7 +710,7 @@ def test_rh_mixing_ratio():
     p = 1013.25 * units.mbar
     temperature = 20. * units.degC
     w = 0.012 * units.dimensionless
-    rh = relative_humidity_from_mixing_ratio(w, temperature, p)
+    rh = relative_humidity_from_mixing_ratio(p, temperature, w)
     assert_almost_equal(rh, 81.7219 * units.percent, 3)
 
 
@@ -758,7 +747,7 @@ def test_rh_specific_humidity():
     p = 1013.25 * units.mbar
     temperature = 20. * units.degC
     q = 0.012 * units.dimensionless
-    rh = relative_humidity_from_specific_humidity(q, temperature, p)
+    rh = relative_humidity_from_specific_humidity(p, temperature, q)
     assert_almost_equal(rh, 82.7145 * units.percent, 3)
 
 
@@ -900,22 +889,6 @@ def test_isentropic_pressure_tmp_out():
     tmpk = tmp * units.kelvin
     isentlev = [296.] * units.kelvin
     isentprs = isentropic_interpolation(isentlev, lev, tmpk, temperature_out=True)
-    truetmp = 296. * units.kelvin
-    assert_almost_equal(isentprs[1], truetmp, 3)
-
-
-@check_and_silence_deprecation
-def test_isentropic_pressure_tmpk_out_deprecation():
-    """Test deprecation warning of `tmpk_out`."""
-    lev = [100000., 95000., 90000., 85000.] * units.Pa
-    tmp = np.ones((4, 5, 5))
-    tmp[0, :] = 296.
-    tmp[1, :] = 292.
-    tmp[2, :] = 290.
-    tmp[3, :] = 288.
-    tmpk = tmp * units.kelvin
-    isentlev = [296.] * units.kelvin
-    isentprs = isentropic_interpolation(isentlev, lev, tmpk, tmpk_out=True)
     truetmp = 296. * units.kelvin
     assert_almost_equal(isentprs[1], truetmp, 3)
 
@@ -1141,7 +1114,7 @@ def test_thickness_hydrostatic():
     pressure = np.array([959., 779.2, 751.3, 724.3, 700., 269.]) * units.hPa
     temperature = np.array([22.2, 14.6, 12., 9.4, 7., -38.]) * units.degC
     mixing = np.array([0.01458, 0.00209, 0.00224, 0.00240, 0.00256, 0.00010])
-    thickness = thickness_hydrostatic(pressure, temperature, mixing=mixing)
+    thickness = thickness_hydrostatic(pressure, temperature, mixing_ratio=mixing)
     assert_almost_equal(thickness, 9892.07 * units.m, 2)
 
 
@@ -1150,7 +1123,7 @@ def test_thickness_hydrostatic_subset():
     pressure = np.array([959., 779.2, 751.3, 724.3, 700., 269.]) * units.hPa
     temperature = np.array([22.2, 14.6, 12., 9.4, 7., -38.]) * units.degC
     mixing = np.array([0.01458, 0.00209, 0.00224, 0.00240, 0.00256, 0.00010])
-    thickness = thickness_hydrostatic(pressure, temperature, mixing=mixing,
+    thickness = thickness_hydrostatic(pressure, temperature, mixing_ratio=mixing,
                                       bottom=850 * units.hPa, depth=150 * units.hPa)
     assert_almost_equal(thickness, 1630.81 * units.m, 2)
 
@@ -1201,7 +1174,7 @@ def test_mixing_ratio_from_rh_dimensions():
     p = 1000. * units.mbar
     temperature = 0. * units.degC
     rh = 100. * units.percent
-    assert (str(mixing_ratio_from_relative_humidity(rh, temperature, p).units)
+    assert (str(mixing_ratio_from_relative_humidity(p, temperature, rh).units)
             == 'dimensionless')
 
 
@@ -1311,7 +1284,7 @@ def test_dewpoint_specific_humidity():
     p = 1013.25 * units.mbar
     temperature = 20. * units.degC
     q = 0.012 * units.dimensionless
-    td = dewpoint_from_specific_humidity(q, temperature, p)
+    td = dewpoint_from_specific_humidity(p, temperature, q)
     assert_almost_equal(td, 16.973 * units.degC, 3)
 
 
@@ -1536,7 +1509,7 @@ def test_vertical_velocity_moist_air():
 def test_specific_humidity_from_dewpoint():
     """Specific humidity from dewpoint."""
     p = 1013.25 * units.mbar
-    q = specific_humidity_from_dewpoint(16.973 * units.degC, p)
+    q = specific_humidity_from_dewpoint(p, 16.973 * units.degC)
     assert_almost_equal(q, 0.012 * units.dimensionless, 3)
 
 
@@ -1585,3 +1558,41 @@ def test_lcl_grid_surface_LCLs():
     temp_truth = np.array([15, 9.10391763, 13]) * units.degC
     assert_array_almost_equal(lcl_pressure, pres_truth, 4)
     assert_array_almost_equal(lcl_temperature, temp_truth, 4)
+
+
+def test_lifted_index():
+    """Test the Lifted Index calculation."""
+    pressure = np.array([1014., 1000., 997., 981.2, 947.4, 925., 914.9, 911.,
+                         902., 883., 850., 822.3, 816., 807., 793.2, 770.,
+                         765.1, 753., 737.5, 737., 713., 700., 688., 685.,
+                         680., 666., 659.8, 653., 643., 634., 615., 611.8,
+                         566.2, 516., 500., 487., 484.2, 481., 475., 460.,
+                         400.]) * units.hPa
+    temperature = np.array([24.2, 24.2, 24., 23.1, 21., 19.6, 18.7, 18.4,
+                            19.2, 19.4, 17.2, 15.3, 14.8, 14.4, 13.4, 11.6,
+                            11.1, 10., 8.8, 8.8, 8.2, 7., 5.6, 5.6,
+                            5.6, 4.4, 3.8, 3.2, 3., 3.2, 1.8, 1.5,
+                            -3.4, -9.3, -11.3, -13.1, -13.1, -13.1, -13.7, -15.1,
+                            -23.5]) * units.degC
+    dewpoint = np.array([23.2, 23.1, 22.8, 22., 20.2, 19., 17.6, 17.,
+                         16.8, 15.5, 14., 11.7, 11.2, 8.4, 7., 4.6,
+                         5., 6., 4.2, 4.1, -1.8, -2., -1.4, -0.4,
+                         -3.4, -5.6, -4.3, -2.8, -7., -25.8, -31.2, -31.4,
+                         -34.1, -37.3, -32.3, -34.1, -37.3, -41.1, -37.7, -58.1,
+                         -57.5]) * units.degC
+    parcel_prof = parcel_profile(pressure, temperature[0], dewpoint[0])
+    LI = lifted_index(pressure, temperature, parcel_prof)
+    assert_almost_equal(LI, -7.9176350 * units.delta_degree_Celsius, 2)
+
+
+def test_gradient_richardson_number():
+    """Test gradient Richardson number calculation."""
+    theta = units('K') * np.asarray([254.5, 258.3, 262.2])
+    u_wnd = units('m/s') * np.asarray([-2., -1.1, 0.23])
+    v_wnd = units('m/s') * np.asarray([3.3, 4.2, 5.2])
+    height = units('km') * np.asarray([0.2, 0.4, 0.6])
+
+    result = gradient_richardson_number(height, theta, u_wnd, v_wnd)
+    expected = np.asarray([24.2503551, 13.6242603, 8.4673744])
+
+    assert_array_almost_equal(result, expected, 4)

@@ -10,13 +10,12 @@ import numpy as np
 import pytest
 
 from metpy.plots import Hodograph, SkewT
-from metpy.testing import check_and_silence_deprecation
 # Fixtures to make sure we have the right backend and consistent round
 from metpy.testing import patch_round, set_agg_backend  # noqa: F401, I202
 from metpy.units import units
 
 
-@pytest.mark.mpl_image_compare(tolerance=.02, remove_text=True, style='default')
+@pytest.mark.mpl_image_compare(tolerance=.0202, remove_text=True, style='default')
 def test_skewt_api():
     """Test the SkewT API."""
     with matplotlib.rc_context({'axes.autolimit_mode': 'data'}):
@@ -47,7 +46,7 @@ def test_skewt_api():
     return fig
 
 
-@pytest.mark.mpl_image_compare(tolerance=.027 if matplotlib.__version__ < '3.2' else 34.4,
+@pytest.mark.mpl_image_compare(tolerance=.0272 if matplotlib.__version__ < '3.2' else 34.4,
                                remove_text=True, style='default')
 def test_skewt_api_units():
     """#Test the SkewT API when units are provided."""
@@ -66,6 +65,9 @@ def test_skewt_api_units():
         skew.plot_moist_adiabats()
         skew.plot_mixing_lines()
 
+        # This works around the fact that newer pint versions default to degrees_Celsius
+        skew.ax.set_xlabel('degC')
+
     return fig
 
 
@@ -82,7 +84,7 @@ def test_skewt_default_aspect_empty():
     return fig
 
 
-@pytest.mark.skipif(matplotlib.__version__ < '3' or matplotlib.__version__ >= '3.2',
+@pytest.mark.skipif(matplotlib.__version__ < '3.2',
                     reason='Matplotlib versions generate different image sizes.')
 @pytest.mark.mpl_image_compare(tolerance=0., remove_text=False, style='default',
                                savefig_kwargs={'bbox_inches': 'tight'})
@@ -147,13 +149,58 @@ def test_skewt_units():
 @pytest.fixture()
 def test_profile():
     """Return data for a test profile."""
-    return np.linspace(1000, 100, 10), np.linspace(20, -20, 10), np.linspace(25, -30, 10)
+    pressure = np.array([966., 937.2, 925., 904.6, 872.6, 853., 850., 836., 821., 811.6, 782.3,
+                         754.2, 726.9, 700., 648.9, 624.6, 601.1, 595., 587., 576., 555.7,
+                         534.2, 524., 500., 473.3, 400., 384.5, 358., 343., 308.3, 300., 276.,
+                         273., 268.5, 250., 244.2, 233., 200.]) * units.mbar
+    temperature = np.array([18.2, 16.8, 16.2, 15.1, 13.3, 12.2, 12.4, 14., 14.4,
+                            13.7, 11.4, 9.1, 6.8, 4.4, -1.4, -4.4, -7.3, -8.1,
+                            -7.9, -7.7, -8.7, -9.8, -10.3, -13.5, -17.1, -28.1, -30.7,
+                            -35.3, -37.1, -43.5, -45.1, -49.9, -50.4, -51.1, -54.1, -55.,
+                            -56.7, -57.5]) * units.degC
+    dewpoint = np.array([16.9, 15.9, 15.5, 14.2, 12.1, 10.8, 8.6, 0., -3.6, -4.4,
+                        -6.9, -9.5, -12., -14.6, -15.8, -16.4, -16.9, -17.1, -27.9, -42.7,
+                        -44.1, -45.6, -46.3, -45.5, -47.1, -52.1, -50.4, -47.3, -57.1,
+                        -57.9, -58.1, -60.9, -61.4, -62.1, -65.1, -65.6,
+                        -66.7, -70.5]) * units.degC
+    profile = np. array([18.2, 16.18287437, 15.68644745, 14.8369451,
+                        13.45220646, 12.57020365, 12.43280242, 11.78283506,
+                        11.0698586, 10.61393901, 9.14490966, 7.66233636,
+                        6.1454231, 4.56888673, 1.31644072, -0.36678427,
+                        -2.09120703, -2.55566745, -3.17594616, -4.05032505,
+                        -5.73356001, -7.62361933, -8.56236581, -10.88846868,
+                        -13.69095789, -22.82604468, -25.08463516, -29.26014016,
+                        -31.81335912, -38.29612829, -39.97374452, -45.11966793,
+                        -45.79482793, -46.82129892, -51.21936594, -52.65924319,
+                        -55.52598916, -64.68843697]) * units.degC
+    return pressure, temperature, dewpoint, profile
 
 
-@pytest.mark.mpl_image_compare(tolerance=.02, remove_text=True, style='default')
+@pytest.mark.mpl_image_compare(tolerance=.033, remove_text=True, style='default')
 def test_skewt_shade_cape_cin(test_profile):
     """Test shading CAPE and CIN on a SkewT plot."""
-    p, t, tp = test_profile
+    p, t, td, tp = test_profile
+
+    with matplotlib.rc_context({'axes.autolimit_mode': 'data'}):
+        fig = plt.figure(figsize=(9, 9))
+        skew = SkewT(fig, aspect='auto')
+        skew.plot(p, t, 'r')
+        skew.plot(p, tp, 'k')
+        skew.shade_cape(p, t, tp)
+        skew.shade_cin(p, t, tp, td)
+        skew.ax.set_xlim(-50, 50)
+        skew.ax.set_ylim(1000, 100)
+
+        # This works around the fact that newer pint versions default to degrees_Celsius
+        skew.ax.set_xlabel('degC')
+
+    return fig
+
+
+@pytest.mark.mpl_image_compare(tolerance=0.033, remove_text=True, style='default')
+def test_skewt_shade_cape_cin_no_limit(test_profile):
+    """Test shading CIN without limits."""
+    p, t, _, tp = test_profile
 
     with matplotlib.rc_context({'axes.autolimit_mode': 'data'}):
         fig = plt.figure(figsize=(9, 9))
@@ -165,13 +212,16 @@ def test_skewt_shade_cape_cin(test_profile):
         skew.ax.set_xlim(-50, 50)
         skew.ax.set_ylim(1000, 100)
 
+        # This works around the fact that newer pint versions default to degrees_Celsius
+        skew.ax.set_xlabel('degC')
+
     return fig
 
 
-@pytest.mark.mpl_image_compare(tolerance=0.02, remove_text=True, style='default')
+@pytest.mark.mpl_image_compare(tolerance=0.033, remove_text=True, style='default')
 def test_skewt_shade_area(test_profile):
     """Test shading areas on a SkewT plot."""
-    p, t, tp = test_profile
+    p, t, _, tp = test_profile
 
     with matplotlib.rc_context({'axes.autolimit_mode': 'data'}):
         fig = plt.figure(figsize=(9, 9))
@@ -182,12 +232,15 @@ def test_skewt_shade_area(test_profile):
         skew.ax.set_xlim(-50, 50)
         skew.ax.set_ylim(1000, 100)
 
+        # This works around the fact that newer pint versions default to degrees_Celsius
+        skew.ax.set_xlabel('degC')
+
     return fig
 
 
 def test_skewt_shade_area_invalid(test_profile):
     """Test shading areas on a SkewT plot."""
-    p, t, tp = test_profile
+    p, t, _, tp = test_profile
     fig = plt.figure(figsize=(9, 9))
     skew = SkewT(fig, aspect='auto')
     skew.plot(p, t, 'r')
@@ -196,10 +249,10 @@ def test_skewt_shade_area_invalid(test_profile):
         skew.shade_area(p, t, tp, which='positve')
 
 
-@pytest.mark.mpl_image_compare(tolerance=0.02, remove_text=True, style='default')
+@pytest.mark.mpl_image_compare(tolerance=0.033, remove_text=True, style='default')
 def test_skewt_shade_area_kwargs(test_profile):
     """Test shading areas on a SkewT plot with kwargs."""
-    p, t, tp = test_profile
+    p, t, _, tp = test_profile
 
     with matplotlib.rc_context({'axes.autolimit_mode': 'data'}):
         fig = plt.figure(figsize=(9, 9))
@@ -210,13 +263,16 @@ def test_skewt_shade_area_kwargs(test_profile):
         skew.ax.set_xlim(-50, 50)
         skew.ax.set_ylim(1000, 100)
 
+        # This works around the fact that newer pint versions default to degrees_Celsius
+        skew.ax.set_xlabel('degC')
+
     return fig
 
 
-@pytest.mark.mpl_image_compare(tolerance=0, remove_text=True, style='default')
+@pytest.mark.mpl_image_compare(tolerance=0.039, remove_text=True, style='default')
 def test_skewt_wide_aspect_ratio(test_profile):
     """Test plotting a skewT with a wide aspect ratio."""
-    p, t, tp = test_profile
+    p, t, _, tp = test_profile
 
     fig = plt.figure(figsize=(12.5, 3))
     skew = SkewT(fig, aspect='auto')
@@ -224,6 +280,9 @@ def test_skewt_wide_aspect_ratio(test_profile):
     skew.plot(p, tp, 'k')
     skew.ax.set_xlim(-30, 50)
     skew.ax.set_ylim(1050, 700)
+
+    # This works around the fact that newer pint versions default to degrees_Celsius
+    skew.ax.set_xlabel('degC')
     return fig
 
 
@@ -428,17 +487,3 @@ def test_united_hodograph_range():
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(1, 1, 1)
     Hodograph(ax, component_range=60. * units.knots)
-
-
-@check_and_silence_deprecation
-def test_plot_colormapped_bounds_deprecation():
-    """Test deprecation of bounds kwarg in `plot_colormapped`."""
-    u = np.zeros(6) * units.knots
-    v = np.array([0, 10, 20, 30, 40, 50]) * units.knots
-    heights = np.array([0, 1000, 2000, 3000, 4000, 5000]) * units.m
-    intervals = np.array([500, 1500, 2500, 3500, 4500]) * units.m
-    colors = ['r', 'g', 'b', 'r']
-    fig = plt.figure(figsize=(7, 7))
-    ax1 = fig.add_subplot(1, 1, 1)
-    h = Hodograph(ax1)
-    h.plot_colormapped(u, v, heights, colors=colors, bounds=intervals)
